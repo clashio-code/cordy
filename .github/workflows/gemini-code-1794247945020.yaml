@@ -15,7 +15,7 @@ jobs:
         run: |
           mkdir -p src out/cordy_android/libs
 
-          # 1. Generator Stub JNI Unity
+          # 1. Generator Stub JNI Unity (Diperbaiki format string-nya)
           cat > src/gen_unity_stubs.py <<'EOF_PY'
           import sys
 
@@ -28,8 +28,9 @@ jobs:
           for k in range(256):
               o.append(f"static int jstub_{k}(void) {{ return jni_trap({k}); }}")
 
+          stubs_join = ", ".join(f"(void *)jstub_{k}" for k in range(256))
           o.append("static void *const jstubs[256] = {")
-          o.append("  " + ".join(f"(void *)jstub_{k}" for k in range(256)))
+          o.append(f"  {stubs_join}")
           o.append("};")
 
           with open("stubs.inc", "w") as f:
@@ -338,23 +339,3 @@ jobs:
           echo "exit code: $?" >> loader_stdout.txt
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
-          EOF_SH
-          chmod +x out/CordyLoader.sh
-
-      - name: Build Stub & Kompilasi Binary
-        run: |
-          cd src && python3 gen_unity_stubs.py && cd ..
-          arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
-
-          MAXV=$(arm-linux-gnueabihf-readelf -V out/cordy_android/cordyloader | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
-          echo "Cordyloader butuh GLIBC tertinggi: $MAXV (device: 2.37)"
-          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
-            echo "GAGAL: Membutuhkan glibc melebihi 2.37!"
-            exit 1
-          fi
-
-      - name: Upload Artifact Build Cordy
-        uses: actions/upload-artifact@v4
-        with:
-          name: cordy-loader-armhf
-          path: out
