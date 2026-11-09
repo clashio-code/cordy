@@ -15,14 +15,14 @@ jobs:
         run: |
           mkdir -p src out/cordy_android/libs
 
-          # 1. Generator Stub JNI Unity
+          # 1. Generator Stub JNI Unity (Diperbaiki penutup kutipnya)
           cat > src/gen_unity_stubs.py <<'EOF_PY'
           import sys
 
           o = []
           o.append("static const char *const jni_names[256] = {")
           for k in range(256):
-              o.append(f'  "slot_{k},')
+              o.append(f'  "slot_{k}",')
           o.append("};")
 
           for k in range(256):
@@ -105,10 +105,6 @@ jobs:
           /* --- FAKE JNI ENVIRONMENT STUBS --- */
           static void *fake_jnienv[512];
           static void *fake_javavm[16];
-
-          static int fake_JNI_GeneralInt(void *env, ...) {
-              return 0;
-          }
 
           static void *fake_JNI_GeneralPtr(void *env, ...) {
               return NULL;
@@ -246,7 +242,7 @@ jobs:
               }
               minv &= ~(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(PAGE - 1);
               m->span = maxv - minv;
-              m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+              m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOus, -1, 0);
               if (m->base == MAP_FAILED) return -1;
               m->bias = (uintptr_t)m->base - minv;
               for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
@@ -316,7 +312,7 @@ jobs:
 
               /* Panggil JNI_OnLoad dengan fake JavaVM pointer */
               typedef int (*jni_onload_t)(void *, void *);
-              jni_onload_t p_onload = (jni_onload_t)mod_find(um, "JNI_OnLoad");
+              jni_onload_t p_onload = (jni_onload_t>mod_find(um, "JNI_OnLoad");
               if (p_onload) {
                   L("[init] Memanggil JNI_OnLoad dengan fake JavaVM di %p...\n", p_onload);
                   p_onload(fake_javavm, NULL);
