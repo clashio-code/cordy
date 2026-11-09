@@ -496,26 +496,33 @@ jobs:
           static int b_sigsuspend(const uint32_t *m) { sigset_t gs; bs2gs(m, &gs); return sigsuspend(&gs); }
 
           /* ======================= shim FP: softfp (game) -> hard-float (glibc/libm/GL) ======================= */
-          #define W1F(n) AAPCS static float w_##n(float x) { return n(x); }
-          #define W2F(n) AAPCS static float w_##n(float x, float y) { return n(x, y); }
-          #define W1D(n) AAPCS static double w_##n(double x) { return n(x); }
-          #define W2D(n) AAPCS static double w_##n(double x, double y) { return n(x, y); }
+          /* Fungsi libm di-resolve lewat dlsym saat runtime (bukan link-time): glibc runner CI baru (2.38-2.43) memberi versi simbol
+           * baru (mis. sinf@GLIBC_2.43, fmod@GLIBC_2.38) yang tidak ada di device (2.37). dlsym di device mengambil versi default yang benar. */
+          static void *fsym(const char *n) {
+            void *p = dlsym(RTLD_DEFAULT, n);
+            if (!p) { L("[FATAL] fungsi libm %s tidak ditemukan\n", n); _exit(98); }
+            return p;
+          }
+          #define W1F(n) AAPCS static float w_##n(float x) { static float (*f)(float); if (!f) *(void **)&f = fsym(#n); return f(x); }
+          #define W2F(n) AAPCS static float w_##n(float x, float y) { static float (*f)(float, float); if (!f) *(void **)&f = fsym(#n); return f(x, y); }
+          #define W1D(n) AAPCS static double w_##n(double x) { static double (*f)(double); if (!f) *(void **)&f = fsym(#n); return f(x); }
+          #define W2D(n) AAPCS static double w_##n(double x, double y) { static double (*f)(double, double); if (!f) *(void **)&f = fsym(#n); return f(x, y); }
           W1F(sinf) W1F(cosf) W1F(tanf) W1F(asinf) W1F(acosf) W1F(atanf) W1F(sqrtf) W1F(floorf) W1F(ceilf) W1F(fabsf)
           W1F(expf) W1F(logf) W1F(log10f) W1F(log2f) W1F(roundf) W1F(truncf) W1F(rintf) W1F(sinhf) W1F(coshf) W1F(tanhf)
           W2F(powf) W2F(atan2f) W2F(fmodf) W2F(hypotf)
           W1D(sin) W1D(cos) W1D(tan) W1D(asin) W1D(acos) W1D(atan) W1D(sqrt) W1D(floor) W1D(ceil) W1D(fabs)
           W1D(exp) W1D(log) W1D(log10) W1D(log2) W1D(round) W1D(trunc) W1D(rint) W1D(sinh) W1D(cosh) W1D(tanh)
           W2D(pow) W2D(atan2) W2D(fmod) W2D(hypot)
-          AAPCS static double w_ldexp(double x, int e) { return ldexp(x, e); }
-          AAPCS static float w_ldexpf(float x, int e) { return ldexpf(x, e); }
-          AAPCS static double w_frexp(double x, int *e) { return frexp(x, e); }
-          AAPCS static float w_frexpf(float x, int *e) { return frexpf(x, e); }
-          AAPCS static double w_modf(double x, double *i) { return modf(x, i); }
-          AAPCS static float w_modff(float x, float *i) { return modff(x, i); }
-          AAPCS static long w_lrintf(float x) { return lrintf(x); }
-          AAPCS static long w_lrint(double x) { return lrint(x); }
-          AAPCS static long w_lroundf(float x) { return lroundf(x); }
-          AAPCS static long w_lround(double x) { return lround(x); }
+          AAPCS static double w_ldexp(double x, int e) { static double (*f)(double, int); if (!f) *(void **)&f = fsym("ldexp"); return f(x, e); }
+          AAPCS static float w_ldexpf(float x, int e) { static float (*f)(float, int); if (!f) *(void **)&f = fsym("ldexpf"); return f(x, e); }
+          AAPCS static double w_frexp(double x, int *e) { static double (*f)(double, int *); if (!f) *(void **)&f = fsym("frexp"); return f(x, e); }
+          AAPCS static float w_frexpf(float x, int *e) { static float (*f)(float, int *); if (!f) *(void **)&f = fsym("frexpf"); return f(x, e); }
+          AAPCS static double w_modf(double x, double *i) { static double (*f)(double, double *); if (!f) *(void **)&f = fsym("modf"); return f(x, i); }
+          AAPCS static float w_modff(float x, float *i) { static float (*f)(float, float *); if (!f) *(void **)&f = fsym("modff"); return f(x, i); }
+          AAPCS static long w_lrintf(float x) { static long (*f)(float); if (!f) *(void **)&f = fsym("lrintf"); return f(x); }
+          AAPCS static long w_lrint(double x) { static long (*f)(double); if (!f) *(void **)&f = fsym("lrint"); return f(x); }
+          AAPCS static long w_lroundf(float x) { static long (*f)(float); if (!f) *(void **)&f = fsym("lroundf"); return f(x); }
+          AAPCS static long w_lround(double x) { static long (*f)(double); if (!f) *(void **)&f = fsym("lround"); return f(x); }
           AAPCS static double w_strtod(const char *s, char **e) { return strtod(s, e); }
           AAPCS static float w_strtof(const char *s, char **e) { return strtof(s, e); }
           AAPCS static double w_atof(const char *s) { return atof(s); }
