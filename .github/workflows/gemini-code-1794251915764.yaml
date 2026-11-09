@@ -1,0 +1,208 @@
+name: build-armhf-cordy-loader
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang toolchain ARM 32-bit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - name: Buat Source Code Custom ELF Loader & Unity Startup Scan
+        run: |
+          mkdir -p src out/cordy_android/libs
+
+          # 1. Generator Stub JNI Unity
+          cat > src/gen_unity_stubs.py <<'EOF_PY'
+          import sys
+
+          o = []
+          o.append("static const char *const jni_names[256] = {")
+          for k in range(256):
+              o.append(f'  "slot_{k}",')
+          o.append("};")
+
+          for k in range(256):
+              o.append(f"static int jstub_{k}(void) {{ return jni_trap({k}); }}")
+
+          stubs_join = ", ".join(f"(void *)jstub_{k}" for k in range(256))
+          o.append("static void *const jstubs[256] = {")
+          o.append(f"  {stubs_join}")
+          o.append("};")
+
+          with open("stubs.inc", "w") as f:
+              f.write("\n".join(o) + "\n")
+          print("stubs.inc berhasil dibuat!")
+          EOF_PY
+
+          # 2. Source Code Cordy Loader dengan Scanner Fungsi Unity
+          cat > src/cordyloader.c <<'EOF_C'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <setjmp.h>
+          #include <elf.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <pthread.h>
+          #include <signal.h>
+          #include <errno.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <gnu/libc-version.h>
+          #include <execinfo.h>
+
+          #define PAGE 4096u
+          #define MAXMOD 4
+          #define U32(p) ((uint32_t)(uintptr_t)(p))
+
+          static FILE *g_log;
+          static void *h_gles, *h_zlib;
+
+          static void L(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap); fflush(stdout);
+            if (g_log) { va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap); fflush(g_log); }
+          }
+
+          static void segfault_handler(int sig) {
+            L("\n[CRASH] Terjadi Segmentation Fault (Signal %d)!\n", sig);
+            void *trace[32];
+            int size = backtrace(trace, 32);
+            char **messages = backtrace_symbols(trace, size);
+            for (int i = 0; i < size; i++) {
+              L("[bt] %s\n", messages[i]);
+            }
+            free(messages);
+            if (g_log) fclose(g_log);
+            exit(1);
+          }
+
+          typedef struct {
+            char name[64];
+            uint8_t *file; size_t fsize;
+            uint8_t *base; size_t span; uintptr_t bias;
+            Elf32_Sym *sym; int nsym; const char *str;
+            Elf32_Rel *rel; uint32_t nrel; Elf32_Rel *jrel; uint32_t njrel;
+          } Mod;
+
+          static Mod mods[MAXMOD];
+          static int nmods;
+
+          static int jni_trap(int slot) {
+            return 0;
+          }
+
+          #include "stubs.inc"
+
+          static char bionic_ctype[1 + 256];
+          static int16_t bionic_tolower[1 + 256], bionic_toupper[1 + 256];
+          static const int16_t *p_tolower = bionic_tolower, *p_toupper = bionic_toupper;
+          static const char *p_ctype = bionic_ctype;
+          static char bionic_sF[3 * 84];
+
+          static void init_bionic_tables(void) {
+            int c;
+            bionic_ctype[0] = 0; bionic_tolower[0] = -1; bionic_toupper[0] = -1;
+            for (c = 0; c < 256; c++) {
+              bionic_ctype[1 + c] = 0;
+              bionic_tolower[1 + c] = (int16_t)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+              bionic_toupper[1 + c] = (int16_t)((c >= 'a' && c <= 'z') ? c - 32 : c);
+            }
+          }
+
+          static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
+            char buf[1024]; va_list ap;
+            va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap); va_end(ap);
+            L("[droid-log %d/%s] %s\n", prio, tag ? tag : "?", buf);
+            return 1;
+          }
+
+          static int *b_errno(void) { return &errno; }
+          static size_t b_strlcpy(char *dst, const char *src, size_t size) {
+            size_t srclen = strlen(src);
+            if (size > 0) {
+              size_t copylen = srclen >= size ? size - 1 : srclen;
+              memcpy(dst, src, copylen);
+              dst[copylen] = '\0';
+            }
+            return srclen;
+          }
+
+          static void *mod_find(const Mod *m, const char *name) {
+            int i;
+            if (!m || !m->sym || !m->str) return NULL;
+            for (i = 1; i < m->nsym; i++) {
+              const Elf32_Sym *s = &m->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(m->str + s->st_name, name) == 0) return (void *)(m->bias + s->st_value);
+            }
+            return NULL;
+          }
+
+          static uint32_t resolve(const Mod *self, const Elf32_Sym *s) {
+            const char *n = self->str + s->st_name;
+            int i; void *p;
+            if (s->st_shndx != SHN_UNDEF) return U32(self->bias + s->st_value);
+            for (i = 0; i < nmods; i++) if (&mods[i] != self && (p = mod_find(&mods[i], n))) return U32(p);
+            
+            if (strcmp(n, "__errno") == 0) return U32(b_errno);
+            if (strcmp(n, "__android_log_print") == 0) return U32(b_android_log_print);
+            if (strcmp(n, "strlcpy") == 0) return U32(b_strlcpy);
+            if (strcmp(n, "sigsetjmp") == 0) return U32(_setjmp);
+            if (strcmp(n, "atexit") == 0) return U32(atexit);
+            if (strcmp(n, "__sF") == 0) return U32(bionic_sF);
+            if (strcmp(n, "_ctype_") == 0) return U32(&p_ctype);
+            if (strcmp(n, "_tolower_tab_") == 0) return U32(&p_tolower);
+            if (strcmp(n, "_toupper_tab_") == 0) return U32(&p_toupper);
+            if (strcmp(n, "__page_size") == 0) return 4096;
+
+            if (h_gles && (p = dlsym(h_gles, n))) return U32(p);
+            if (h_zlib && (p = dlsym(h_zlib, n))) return U32(p);
+            if ((p = dlsym(RTLD_DEFAULT, n))) return U32(p);
+            
+            return 0;
+          }
+
+          static int read_file(const char *path, uint8_t **buf, size_t *len) {
+            FILE *f = fopen(path, "rb"); long n;
+            if (!f) return -1;
+            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            *buf = malloc((size_t)n);
+            if (!*buf || fread(*buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); return -1; }
+            fclose(f); *len = (size_t)n;
+            return 0;
+          }
+
+          static int load_mod(const char *dir, const char *name, Mod **out) {
+            char path[512]; Mod *m; const Elf32_Ehdr *eh; const Elf32_Phdr *ph;
+            uint32_t minv = 0xFFFFFFFFu, maxv = 0; int i;
+            if (nmods >= MAXMOD) return -1;
+            m = &mods[nmods]; memset(m, 0, sizeof *m);
+            snprintf(m->name, sizeof m->name, "%s", name);
+            snprintf(path, sizeof path, "%s/%s", dir, name);
+            if (read_file(path, &m->file, &m->fsize) != 0) return -1;
+            eh = (const Elf32_Ehdr *)m->file;
+            ph = (const Elf32_Phdr *)(m->file + eh->e_phoff);
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              if (ph[i].p_vaddr < minv) minv = ph[i].p_vaddr;
+              if (ph[i].p_vaddr + ph[i].p_memsz > maxv) maxv = ph[i].p_vaddr + ph[i].p_memsz;
+            }
+            minv &= ~(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(PAGE - 1);
+            m->span = maxv - minv;
+            m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (m->base == MAP_FAILED) return -1;
+            m->bias = (uintptr_t)m->base - minv;
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              memcpy((void *)(m->bias + ph[i].p_vaddr), m->file + ph[i].p_offset, ph[i].p_filesz);
+            }
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_DYNAMIC) {
+              const Elf32_Dyn *d = (const Elf32_Dyn *)(m->bias + ph[i].p_vaddr);
+              for (; d->d_tag != DT_NULL; d++) {
+                switch (d->d_tag)
