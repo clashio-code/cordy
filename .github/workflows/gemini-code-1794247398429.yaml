@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & Unity Linker
+      - name: Buat Source Code Custom ELF Loader & Full Bionic Shims
         run: |
           mkdir -p src out/cordy_android/libs
 
@@ -37,7 +37,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader (Full OpenGL, Zlib, & Bionic Shim)
+          # 2. Source Code Cordy Loader dengan Full Shims
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -88,7 +88,23 @@ jobs:
 
           #include "stubs.inc"
 
-          /* ================= SHIMS & RESOLVERS ================= */
+          /* ================= FULL BIONIC SHIMS ================= */
+          static char bionic_ctype[1 + 256];
+          static int16_t bionic_tolower[1 + 256], bionic_toupper[1 + 256];
+          static const int16_t *p_tolower = bionic_tolower, *p_toupper = bionic_toupper;
+          static const char *p_ctype = bionic_ctype;
+          static char bionic_sF[3 * 84];
+
+          static void init_bionic_tables(void) {
+            int c;
+            bionic_ctype[0] = 0; bionic_tolower[0] = -1; bionic_toupper[0] = -1;
+            for (c = 0; c < 256; c++) {
+              bionic_ctype[1 + c] = 0;
+              bionic_tolower[1 + c] = (int16_t)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+              bionic_toupper[1 + c] = (int16_t)((c >= 'a' && c <= 'z') ? c - 32 : c);
+            }
+          }
+
           static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
             char buf[1024]; va_list ap;
             va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap); va_end(ap);
@@ -96,7 +112,23 @@ jobs:
             return 1;
           }
 
+          static int b_android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
+            char buf[1024];
+            vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap);
+            L("[droid-vlog %d/%s] %s\n", prio, tag ? tag : "?", buf);
+            return 1;
+          }
+
           static int *b_errno(void) { return &errno; }
+          static size_t b_strlcpy(char *dst, const char *src, size_t size) {
+            size_t srclen = strlen(src);
+            if (size > 0) {
+              size_t copylen = srclen >= size ? size - 1 : srclen;
+              memcpy(dst, src, copylen);
+              dst[copylen] = '\0';
+            }
+            return srclen;
+          }
 
           typedef struct {
             uint32_t state[5];
@@ -133,18 +165,26 @@ jobs:
             
             if (strcmp(n, "__errno") == 0) return U32(b_errno);
             if (strcmp(n, "__android_log_print") == 0) return U32(b_android_log_print);
+            if (strcmp(n, "__android_log_vprint") == 0) return U32(b_android_log_vprint);
+            if (strcmp(n, "strlcpy") == 0) return U32(b_strlcpy);
+            if (strcmp(n, "sigsetjmp") == 0) return U32(_setjmp);
+            if (strcmp(n, "atexit") == 0) return U32(atexit);
+            if (strcmp(n, "__sF") == 0) return U32(bionic_sF);
+            if (strcmp(n, "_ctype_") == 0) return U32(&p_ctype);
+            if (strcmp(n, "_tolower_tab_") == 0) return U32(&p_tolower);
+            if (strcmp(n, "_toupper_tab_") == 0) return U32(&p_toupper);
+            if (strcmp(n, "data_start") == 0) return 0;
+            if (strcmp(n, "__page_size") == 0) return 4096;
+            if (strcmp(n, "tkill") == 0 || strcmp(n, "__pthread_cleanup_pop") == 0 || strcmp(n, "__pthread_cleanup_push") == 0 || strcmp(n, "__get_h_errno") == 0) return 0;
+
             if (strcmp(n, "SHA1Init") == 0) return U32(SHA1Init);
             if (strcmp(n, "SHA1Update") == 0) return U32(SHA1Update);
             if (strcmp(n, "SHA1Final") == 0) return U32(SHA1Final);
 
-            /* Tangkap fungsi OpenGL dari libGLESv2 */
             if (h_gles && (p = dlsym(h_gles, n))) return U32(p);
-            /* Tangkap fungsi Zlib dari libz */
             if (h_zlib && (p = dlsym(h_zlib, n))) return U32(p);
-
             if ((p = dlsym(RTLD_DEFAULT, n))) return U32(p);
             
-            L("[resolve] Simbol tidak ditemukan: %s\n", n);
             return 0;
           }
 
@@ -230,6 +270,8 @@ jobs:
             g_log = fopen("loader_log.txt", "w");
             L("== Cordy Unity 3.5.4f1 Full Linker (armhf) ==\n");
 
+            init_bionic_tables();
+
             dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
             h_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
             h_zlib = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
@@ -240,7 +282,7 @@ jobs:
             if (load_mod("libs", "libunity.so", &um) != 0) return 1;
             relocate(um);
 
-            L("SUKSES: Semua simbol grafis & zlib berhasil di-link ke sistem!\n");
+            L("SUKSES: Semua simbol bionic, grafis, & zlib berhasil di-link!\n");
             if (g_log) fclose(g_log);
             return 0;
           }
