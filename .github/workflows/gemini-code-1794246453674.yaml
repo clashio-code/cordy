@@ -117,24 +117,25 @@ jobs:
             printf("== Cordy Unity 3.5.4f1 Loader (armhf) ==\n");
             printf("Glibc Target: %s\n", gnu_get_libc_version());
 
-            void *h_unity = dlopen("libs/libunity.so", RTLD_NOW | RTLD_GLOBAL);
-            if (!h_unity) {
-              printf("GAGAL memuat libunity.so: %s\n", dlerror());
-              return 1;
-            }
-
+            /* Load libmono.so DULU karena libunity bergantung padanya */
             void *h_mono = dlopen("libs/libmono.so", RTLD_NOW | RTLD_GLOBAL);
             if (!h_mono) {
               printf("GAGAL memuat libmono.so: %s\n", dlerror());
               return 1;
             }
 
-            printf("Berhasil memuat libunity.so dan libmono.so!\n");
+            void *h_unity = dlopen("libs/libunity.so", RTLD_NOW | RTLD_GLOBAL);
+            if (!h_unity) {
+              printf("GAGAL memuat libunity.so: %s\n", dlerror());
+              return 1;
+            }
+
+            printf("Berhasil memuat libmono.so dan libunity.so!\n");
             return 0;
           }
           EOF_C
 
-          # 3. Skrip Peluncur Cordy (PortMaster standard)
+          # 3. Skrip Peluncur Cordy (PortMaster standard dengan LD_LIBRARY_PATH lokal)
           cat > out/CordyLoader.sh <<'EOF_SH'
           #!/bin/bash
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -155,7 +156,7 @@ jobs:
 
           cd "$GAMEDIR" || exit 1
 
-          export LD_LIBRARY_PATH="/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
+          export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
           chmod +x ./cordyloader 2>/dev/null
 
           ./cordyloader > loader_stdout.txt 2>&1
