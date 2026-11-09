@@ -205,4 +205,112 @@ jobs:
             for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_DYNAMIC) {
               const Elf32_Dyn *d = (const Elf32_Dyn *)(m->bias + ph[i].p_vaddr);
               for (; d->d_tag != DT_NULL; d++) {
-                switch (d->d_tag)
+                switch (d->d_tag) {
+                  case DT_SYMTAB: m->sym = (Elf32_Sym *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_STRTAB: m->str = (const char *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_REL: m->rel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_RELSZ: m->nrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
+                  case DT_JMPREL: m->jrel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_PLTRELSZ: m->njrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
+                }
+              }
+            }
+            if (eh->e_shoff && (size_t)eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf32_Shdr) <= m->fsize) {
+              const Elf32_Shdr *sh = (const Elf32_Shdr *)(m->file + eh->e_shoff);
+              for (i = 0; i < eh->e_shnum; i++) if (sh[i].sh_type == SHT_DYNSYM) m->nsym = (int)(sh[i].sh_size / sizeof(Elf32_Sym));
+            }
+            nmods++; *out = m;
+            return 0;
+          }
+
+          static int relocate(Mod *m) {
+            int pass;
+            for (pass = 0; pass < 2; pass++) {
+              Elf32_Rel *r = pass ? m->jrel : m->rel;
+              uint32_t n = pass ? m->njrel : m->nrel, k;
+              for (k = 0; k < n; k++) {
+                uint32_t type = ELF32_R_TYPE(r[k].r_info), si = ELF32_R_SYM(r[k].r_info);
+                uint32_t *where = (uint32_t *)(m->bias + r[k].r_offset);
+                switch (type) {
+                  case R_ARM_NONE: break;
+                  case R_ARM_RELATIVE: *where += U32(m->bias); break;
+                  case R_ARM_ABS32: if (si) *where += resolve(m, &m->sym[si]); break;
+                  case R_ARM_GLOB_DAT: case R_ARM_JUMP_SLOT: *where = resolve(m, &m->sym[si]); break;
+                  default: break;
+                }
+              }
+            }
+            return 0;
+          }
+
+          int main(int argc, char **argv) {
+            signal(SIGSEGV, segfault_handler);
+            signal(SIGABRT, segfault_handler);
+
+            Mod *fm = NULL, *um = NULL;
+            g_log = fopen("loader_log.txt", "w");
+            L("== Cordy Unity Symbol Scanner ==\n");
+
+            init_bionic_tables();
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            h_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
+            h_zlib = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
+
+            if (load_mod("libs", "libmono.so", &fm) != 0) return 1;
+            relocate(fm);
+            if (load_mod("libs", "libunity.so", &um) != 0) return 1;
+            relocate(um);
+
+            /* Scan fungsi penting di libunity.so */
+            L("[scan] Mencari fungsi Unity/Java...\n");
+            for (int i = 1; i < um->nsym; i++) {
+              const Elf32_Sym *s = &um->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name) {
+                const char *symname = um->str + s->st_name;
+                if (strstr(symname, "Unity") || strstr(symname, "Java_") || strstr(symname, "mono")) {
+                  L("[sym] %s -> %p\n", symname, (void *)(um->bias + s->st_value));
+                }
+              }
+            }
+
+            L("SUKSES: Scan selesai!\n");
+            if (g_log) fclose(g_log);
+            return 0;
+          }
+          EOF_C
+
+          cat > out/CordyLoader.sh <<'EOF_SH'
+          #!/bin/bash
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+          GAMEDIR="/$directory/ports/cordy_android"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/cordy_android"
+          cd "$GAMEDIR" || exit 1
+          export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
+          chmod +x ./cordyloader 2>/dev/null
+          rm -f loader_stdout.txt loader_log.txt
+          ./cordyloader > loader_stdout.txt 2>&1
+          echo "exit code: $?" >> loader_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH
+          chmod +x out/CordyLoader.sh
+
+      - name: Build & Kompilasi
+        run: |
+          cd src && python3 gen_unity_stubs.py && cd ..
+          arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordy-loader-armhf
+          path: out
