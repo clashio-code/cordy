@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & Unity Init Hook
+      - name: Buat Source Code Custom ELF Loader & Symbol Scanner
         run: |
           mkdir -p src out/cordy_android/libs
 
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader dengan Unity Entry Point Hook
+          # 2. Source Code Cordy Loader dengan Symbol Dumper
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -262,23 +262,21 @@ jobs:
             relocate(um);
 
             L("[init] Modul siap dijalankan.\n");
-            
-            void *p_msg = mod_find(um, "UnitySendMessage");
-            if (p_msg) {
-              L("[init] UnitySendMessage ditemukan di %p\n", p_msg);
-            }
 
-            /* Coba panggil entry point Unity jika tersedia */
-            typedef void (*unity_init_t)(void);
-            unity_init_t p_init = (unity_init_t)mod_find(um, "UnityPlayer_load");
-            if (!p_init) p_init = (unity_init_t)mod_find(um, "Java_com_unity3d_player_UnityPlayer_nativeInit");
-            
-            if (p_init) {
-              L("[init] Memanggil entry point Unity di %p...\n", p_init);
-              p_init();
-            } else {
-              L("[init] Peringatan: Entry point standar Unity tidak ditemukan, mencoba lanjut...\n");
+            /* Dump semua symbol yang mengandung kata 'Unity', 'Player', atau 'native' */
+            L("--- Scanning Exported Symbols in libunity.so ---\n");
+            if (um && um->sym && um->str) {
+              for (int i = 1; i < um->nsym; i++) {
+                const Elf32_Sym *s = &um->sym[i];
+                if (s->st_name) {
+                  const char *symname = um->str + s->st_name;
+                  if (strstr(symname, "Unity") || strstr(symname, "Player") || strstr(symname, "native") || strstr(symname, "Init")) {
+                    L("Found symbol: %s\n", symname);
+                  }
+                }
+              }
             }
+            L("------------------------------------------------\n");
 
             L("SUKSES: Loader utama Berjalan!\n");
             if (g_log) fclose(g_log);
