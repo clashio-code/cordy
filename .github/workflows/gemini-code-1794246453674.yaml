@@ -11,11 +11,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Loader & Shim Cordy (Unity 3.5.4f1)
+      - name: Buat Source Code Loader, Shim, & liblog Dummy
         run: |
           mkdir -p src out/cordy_android/libs
 
-          # 1. Generator Stub JNI Unity
+          # 1. Kompilasi liblog.so bimbingan bionic (Bypass LD_SO)
+          cat > src/liblog_shim.c <<'EOF_LOG'
+          #include <stdio.h>
+          #include <stdarg.h>
+
+          int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
+              char buf[1024];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(buf, sizeof(buf), fmt ? fmt : "", ap);
+              va_end(ap);
+              printf("[liblog] %s\n", buf);
+              return 0;
+          }
+
+          int __android_log_write(int prio, const char *tag, const char *text) {
+              printf("[liblog] %s\n", text ? text : "");
+              return 0;
+          }
+          EOF_LOG
+
+          arm-linux-gnueabihf-gcc -shared -fPIC src/liblog_shim.c -o out/cordy_android/libs/liblog.so
+
+          # 2. Generator Stub JNI Unity
           cat > src/gen_unity_stubs.py <<'EOF_PY'
           import sys
 
@@ -37,7 +60,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Utama Cordy Loader dengan Bionic Shim (liblog, SHA1, dll)
+          # 3. Source Code Utama Cordy Loader dengan Bionic Shim (SHA1, dll)
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -54,22 +77,6 @@ jobs:
           #include <sys/mman.h>
           #include <sys/stat.h>
           #include <gnu/libc-version.h>
-
-          /* ================= SHIM ANDROID LOG ================= */
-          static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
-            char buf[1024];
-            va_list ap;
-            va_start(ap, fmt);
-            vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap);
-            va_end(ap);
-            printf("[droid-log %d/%s] %s\n", prio, tag ? tag : "?", buf);
-            return 1;
-          }
-
-          static int b_android_log_write(int prio, const char *tag, const char *text) {
-            printf("[droid-log %d/%s] %s\n", prio, tag ? tag : "?", text ? text : "");
-            return 1;
-          }
 
           static int *b_errno(void) {
             return &errno;
@@ -116,30 +123,11 @@ jobs:
 
           #include "stubs.inc"
 
-          /* Intercept dlopen untuk memalsukan liblog.so yang dicari libmono */
-          static void *b_dlopen(const char *filename, int flag) {
-            if (filename && strstr(filename, "liblog.so")) {
-              printf("[shim] dlopen(\"liblog.so\") dipalsukan ke dirinya sendiri.\n");
-              return dlopen(NULL, flag);
-            }
-            return dlopen(filename, flag);
-          }
-
-          static void *b_dlsym(void *handle, const char *symbol) {
-            if (strcmp(symbol, "__android_log_print") == 0) return (void *)b_android_log_print;
-            if (strcmp(symbol, "__android_log_write") == 0) return (void *)b_android_log_write;
-            if (strcmp(symbol, "__errno") == 0) return (void *)b_errno;
-            if (strcmp(symbol, "SHA1Init") == 0) return (void *)SHA1Init;
-            if (strcmp(symbol, "SHA1Update") == 0) return (void *)SHA1Update;
-            if (strcmp(symbol, "SHA1Final") == 0) return (void *)SHA1Final;
-            return dlsym(handle, symbol);
-          }
-
           int main(int argc, char **argv) {
             printf("== Cordy Unity 3.5.4f1 Loader (armhf) ==\n");
             printf("Glibc Target: %s\n", gnu_get_libc_version());
 
-            /* Override global symbol agar dlsym bisa menangkap shim bionic kita */
+            /* Global symbol agar dlsym bisa menangkap shim */
             dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
 
             void *h_mono = dlopen("libs/libmono.so", RTLD_NOW | RTLD_GLOBAL);
@@ -159,7 +147,7 @@ jobs:
           }
           EOF_C
 
-          # 3. Skrip Peluncur Cordy
+          # 4. Skrip Peluncur Cordy
           cat > out/CordyLoader.sh <<'EOF_SH'
           #!/bin/bash
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
