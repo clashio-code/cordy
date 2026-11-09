@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & Step-by-Step Debug
+      - name: Buat Source Code Custom ELF Loader & Mono JIT Launch
         run: |
           mkdir -p src out/cordy_android/libs
 
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader dengan Step Logging
+          # 2. Source Code Cordy Loader dengan Eksekusi Mono JIT
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -91,7 +91,6 @@ jobs:
             uint8_t *base; size_t span; uintptr_t bias;
             Elf32_Sym *sym; int nsym; const char *str;
             Elf32_Rel *rel; uint32_t nrel; Elf32_Rel *jrel; uint32_t njrel;
-            uint32_t init; uint32_t *iarr; uint32_t niarr;
           } Mod;
 
           static Mod mods[MAXMOD];
@@ -285,7 +284,7 @@ jobs:
 
             Mod *fm = NULL, *um = NULL;
             g_log = fopen("loader_log.txt", "w");
-            L("== Cordy Step Debug (armhf) ==\n");
+            L("== Cordy JIT Launcher (armhf) ==\n");
 
             init_bionic_tables();
 
@@ -293,25 +292,32 @@ jobs:
             h_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
             h_zlib = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
 
-            L("[step] Memuat libmono.so...\n");
             if (load_mod("libs", "libmono.so", &fm) != 0) return 1;
-            L("[step] Merelokasi libmono.so...\n");
             relocate(fm);
 
-            L("[step] Memuat libunity.so...\n");
             if (load_mod("libs", "libunity.so", &um) != 0) return 1;
-            L("[step] Merelokasi libunity.so...\n");
             relocate(um);
 
-            L("[step] Mencari simbol mono_jit_init...\n");
-            void *p_mono_init = mod_find(fm, "mono_jit_init");
-            if (p_mono_init) {
-              L("[mono] mono_jit_init ditemukan di %p\n", p_mono_init);
-            } else {
-              L("[mono] mono_jit_init tidak ditemukan.\n");
+            /* Konfigurasi direktori Mono */
+            void *p_set_dirs = mod_find(fm, "mono_set_dirs");
+            if (p_set_dirs) {
+              void (*mono_set_dirs)(const char *, const char *) = (void (*)(const char *, const char *))p_set_dirs;
+              mono_set_dirs("libs", "libs");
+              L("[mono] mono_set_dirs berhasil di-set ke folder libs\n");
             }
 
-            L("SUKSES: Debug step selesai tanpa crash!\n");
+            /* Eksekusi mono_jit_init */
+            void *p_mono_init = mod_find(fm, "mono_jit_init");
+            if (p_mono_init) {
+              L("[mono] Menjalankan mono_jit_init...\n");
+              void *(*mono_jit_init)(const char *) = (void *(*)(const char *))p_mono_init;
+              void *domain = mono_jit_init("CordyDomain");
+              L("[mono] Domain VM sukses diinisialisasi pada pointer: %p\n", domain);
+            } else {
+              L("[mono] Error: mono_jit_init tidak ditemukan.\n");
+            }
+
+            L("SUKSES: Launcher JIT selesai dieksekusi!\n");
             if (g_log) fclose(g_log);
             return 0;
           }
