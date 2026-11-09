@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & Unity Render Loop
+      - name: Buat Source Code Custom ELF Loader & Copy Assets
         run: |
           mkdir -p src out/cordy_android/libs
 
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader dengan Render Loop Hook
+          # 2. Source Code Cordy Loader
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -263,7 +263,6 @@ jobs:
 
             L("[init] Modul siap dijalankan.\n");
             
-            /* Panggil fungsi messaging dasar Unity jika ada */
             void *p_msg = mod_find(um, "UnitySendMessage");
             if (p_msg) {
               L("[init] UnitySendMessage ditemukan di %p\n", p_msg);
@@ -275,6 +274,7 @@ jobs:
           }
           EOF_C
 
+          # 3. Skrip PortMaster dengan Auto-copy Assets
           cat > out/CordyLoader.sh <<'EOF_SH'
           #!/bin/bash
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -290,6 +290,12 @@ jobs:
           GAMEDIR="/$directory/ports/cordy_android"
           [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/cordy_android"
           cd "$GAMEDIR" || exit 1
+
+          # Salin isi folder assets ke root direktori agar terbaca libunity.so
+          if [ -d "assets" ]; then
+            cp -rf assets/* ./
+          fi
+
           export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
           chmod +x ./cordyloader 2>/dev/null
           rm -f loader_stdout.txt loader_log.txt
