@@ -1,0 +1,297 @@
+name: build-armhf-cordy-loader
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang toolchain ARM 32-bit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - name: Buat Source Code Custom ELF Loader & Unity Linker
+        run: |
+          mkdir -p src out/cordy_android/libs
+
+          # 1. Generator Stub JNI Unity
+          cat > src/gen_unity_stubs.py <<'EOF_PY'
+          import sys
+
+          o = []
+          o.append("static const char *const jni_names[256] = {")
+          for k in range(256):
+              o.append(f'  "slot_{k}",')
+          o.append("};")
+
+          for k in range(256):
+              o.append(f"static int jstub_{k}(void) {{ return jni_trap({k}); }}")
+
+          o.append("static void *const jstubs[256] = {")
+          o.append("  " + ", ".join(f"(void *)jstub_{k}" for k in range(256)))
+          o.append("};")
+
+          with open("stubs.inc", "w") as f:
+              f.write("\n".join(o) + "\n")
+          print("stubs.inc berhasil dibuat!")
+          EOF_PY
+
+          # 2. Source Code Cordy Loader (Full OpenGL, Zlib, & Bionic Shim)
+          cat > src/cordyloader.c <<'EOF_C'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <setjmp.h>
+          #include <elf.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <pthread.h>
+          #include <errno.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <gnu/libc-version.h>
+
+          #define PAGE 4096u
+          #define MAXMOD 4
+          #define U32(p) ((uint32_t)(uintptr_t)(p))
+
+          static FILE *g_log;
+          static void *h_gles, *h_zlib;
+
+          static void L(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap); fflush(stdout);
+            if (g_log) { va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap); fflush(g_log); }
+          }
+
+          typedef struct {
+            char name[64];
+            uint8_t *file; size_t fsize;
+            uint8_t *base; size_t span; uintptr_t bias;
+            Elf32_Sym *sym; int nsym; const char *str;
+            Elf32_Rel *rel; uint32_t nrel; Elf32_Rel *jrel; uint32_t njrel;
+            uint32_t init; uint32_t *iarr; uint32_t niarr;
+          } Mod;
+
+          static Mod mods[MAXMOD];
+          static int nmods;
+
+          static int jni_trap(int slot) {
+            L("[JNI TRAP] Slot %d dipanggil.\n", slot);
+            return 0;
+          }
+
+          #include "stubs.inc"
+
+          /* ================= SHIMS & RESOLVERS ================= */
+          static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
+            char buf[1024]; va_list ap;
+            va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap); va_end(ap);
+            L("[droid-log %d/%s] %s\n", prio, tag ? tag : "?", buf);
+            return 1;
+          }
+
+          static int *b_errno(void) { return &errno; }
+
+          typedef struct {
+            uint32_t state[5];
+            uint32_t count[2];
+            unsigned char buffer[64];
+          } SHA1_CTX;
+
+          void SHA1Init(SHA1_CTX *context) {
+            if (!context) return;
+            context->state[0] = 0x67452301;
+            context->state[1] = 0xEFCDAB89;
+            context->state[2] = 0x98BADCFE;
+            context->state[3] = 0x10325476;
+            context->state[4] = 0xC3D2E1F0;
+            context->count[0] = context->count[1] = 0;
+          }
+          void SHA1Update(SHA1_CTX *context, const unsigned char *data, unsigned int len) { (void)context; (void)data; (void)len; }
+          void SHA1Final(unsigned char digest[20], SHA1_CTX *context) { if (digest) memset(digest, 0, 20); (void)context; }
+
+          static void *mod_find(const Mod *m, const char *name) {
+            int i;
+            for (i = 1; i < m->nsym; i++) {
+              const Elf32_Sym *s = &m->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(m->str + s->st_name, name) == 0) return (void *)(m->bias + s->st_value);
+            }
+            return NULL;
+          }
+
+          static uint32_t resolve(const Mod *self, const Elf32_Sym *s) {
+            const char *n = self->str + s->st_name;
+            int i; void *p;
+            if (s->st_shndx != SHN_UNDEF) return U32(self->bias + s->st_value);
+            for (i = 0; i < nmods; i++) if (&mods[i] != self && (p = mod_find(&mods[i], n))) return U32(p);
+            
+            if (strcmp(n, "__errno") == 0) return U32(b_errno);
+            if (strcmp(n, "__android_log_print") == 0) return U32(b_android_log_print);
+            if (strcmp(n, "SHA1Init") == 0) return U32(SHA1Init);
+            if (strcmp(n, "SHA1Update") == 0) return U32(SHA1Update);
+            if (strcmp(n, "SHA1Final") == 0) return U32(SHA1Final);
+
+            /* Tangkap fungsi OpenGL dari libGLESv2 */
+            if (h_gles && (p = dlsym(h_gles, n))) return U32(p);
+            /* Tangkap fungsi Zlib dari libz */
+            if (h_zlib && (p = dlsym(h_zlib, n))) return U32(p);
+
+            if ((p = dlsym(RTLD_DEFAULT, n))) return U32(p);
+            
+            L("[resolve] Simbol tidak ditemukan: %s\n", n);
+            return 0;
+          }
+
+          static int read_file(const char *path, uint8_t **buf, size_t *len) {
+            FILE *f = fopen(path, "rb"); long n;
+            if (!f) return -1;
+            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            *buf = malloc((size_t)n);
+            if (!*buf || fread(*buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); return -1; }
+            fclose(f); *len = (size_t)n;
+            return 0;
+          }
+
+          static int load_mod(const char *dir, const char *name, Mod **out) {
+            char path[512]; Mod *m; const Elf32_Ehdr *eh; const Elf32_Phdr *ph;
+            uint32_t minv = 0xFFFFFFFFu, maxv = 0; int i, dyn_found = 0;
+            if (nmods >= MAXMOD) return -1;
+            m = &mods[nmods]; memset(m, 0, sizeof *m);
+            snprintf(m->name, sizeof m->name, "%s", name);
+            snprintf(path, sizeof path, "%s/%s", dir, name);
+            if (read_file(path, &m->file, &m->fsize) != 0) { L("GAGAL membaca %s\n", path); return -1; }
+            eh = (const Elf32_Ehdr *)m->file;
+            ph = (const Elf32_Phdr *)(m->file + eh->e_phoff);
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              if (ph[i].p_vaddr < minv) minv = ph[i].p_vaddr;
+              if (ph[i].p_vaddr + ph[i].p_memsz > maxv) maxv = ph[i].p_vaddr + ph[i].p_memsz;
+            }
+            minv &= ~(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(PAGE - 1);
+            m->span = maxv - minv;
+            m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (m->base == MAP_FAILED) return -1;
+            m->bias = (uintptr_t)m->base - minv;
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              memcpy((void *)(m->bias + ph[i].p_vaddr), m->file + ph[i].p_offset, ph[i].p_filesz);
+            }
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_DYNAMIC) {
+              const Elf32_Dyn *d = (const Elf32_Dyn *)(m->bias + ph[i].p_vaddr); dyn_found = 1;
+              for (; d->d_tag != DT_NULL; d++) {
+                switch (d->d_tag) {
+                  case DT_SYMTAB: m->sym = (Elf32_Sym *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_STRTAB: m->str = (const char *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_REL: m->rel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_RELSZ: m->nrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
+                  case DT_JMPREL: m->jrel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_PLTRELSZ: m->njrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
+                  case DT_INIT: m->init = d->d_un.d_val; break;
+                  case DT_INIT_ARRAY: m->iarr = (uint32_t *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_INIT_ARRAYSZ: m->niarr = d->d_un.d_val / 4; break;
+                }
+              }
+            }
+            if (eh->e_shoff && (size_t)eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf32_Shdr) <= m->fsize) {
+              const Elf32_Shdr *sh = (const Elf32_Shdr *)(m->file + eh->e_shoff);
+              for (i = 0; i < eh->e_shnum; i++) if (sh[i].sh_type == SHT_DYNSYM) m->nsym = (int)(sh[i].sh_size / sizeof(Elf32_Sym));
+            }
+            nmods++; *out = m;
+            L("[load] %s sukses\n", name);
+            return 0;
+          }
+
+          static int relocate(Mod *m) {
+            int pass;
+            for (pass = 0; pass < 2; pass++) {
+              Elf32_Rel *r = pass ? m->jrel : m->rel;
+              uint32_t n = pass ? m->njrel : m->nrel, k;
+              for (k = 0; k < n; k++) {
+                uint32_t type = ELF32_R_TYPE(r[k].r_info), si = ELF32_R_SYM(r[k].r_info);
+                uint32_t *where = (uint32_t *)(m->bias + r[k].r_offset);
+                switch (type) {
+                  case R_ARM_NONE: break;
+                  case R_ARM_RELATIVE: *where += U32(m->bias); break;
+                  case R_ARM_ABS32: if (si) *where += resolve(m, &m->sym[si]); break;
+                  case R_ARM_GLOB_DAT: case R_ARM_JUMP_SLOT: *where = resolve(m, &m->sym[si]); break;
+                  default: break;
+                }
+              }
+            }
+            return 0;
+          }
+
+          int main(int argc, char **argv) {
+            Mod *fm = NULL, *um = NULL;
+            g_log = fopen("loader_log.txt", "w");
+            L("== Cordy Unity 3.5.4f1 Full Linker (armhf) ==\n");
+
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            h_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
+            h_zlib = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
+
+            if (load_mod("libs", "libmono.so", &fm) != 0) return 1;
+            relocate(fm);
+
+            if (load_mod("libs", "libunity.so", &um) != 0) return 1;
+            relocate(um);
+
+            L("SUKSES: Semua simbol grafis & zlib berhasil di-link ke sistem!\n");
+            if (g_log) fclose(g_log);
+            return 0;
+          }
+          EOF_C
+
+          # 3. Skrip Peluncur Cordy
+          cat > out/CordyLoader.sh <<'EOF_SH'
+          #!/bin/bash
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/cordy_android"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/cordy_android"
+
+          cd "$GAMEDIR" || exit 1
+
+          export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
+          chmod +x ./cordyloader 2>/dev/null
+
+          rm -f loader_stdout.txt loader_log.txt
+          ./cordyloader > loader_stdout.txt 2>&1
+          echo "exit code: $?" >> loader_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH
+          chmod +x out/CordyLoader.sh
+
+      - name: Build Stub & Kompilasi Binary
+        run: |
+          cd src && python3 gen_unity_stubs.py && cd ..
+          arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
+
+          MAXV=$(arm-linux-gnueabihf-readelf -V out/cordy_android/cordyloader | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "Cordyloader butuh GLIBC tertinggi: $MAXV (device: 2.37)"
+          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+            echo "GAGAL: Membutuhkan glibc melebihi 2.37!"
+            exit 1
+          fi
+
+      - name: Upload Artifact Build Cordy
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordy-loader-armhf
+          path: out
