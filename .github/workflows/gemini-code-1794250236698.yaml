@@ -11,11 +11,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & Unity Execution Hook
+      - name: Buat Source Code Custom ELF Loader & Crash Handler
         run: |
           mkdir -p src out/cordy_android/libs
 
-          # 1. Generator Stub JNI Unity (Diperbaiki format string-nya)
+          # 1. Generator Stub JNI Unity
           cat > src/gen_unity_stubs.py <<'EOF_PY'
           import sys
 
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader dengan Eksekusi Init Unity
+          # 2. Source Code Cordy Loader dengan Crash Handler (SIGSEGV)
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -52,10 +52,12 @@ jobs:
           #include <fcntl.h>
           #include <unistd.h>
           #include <pthread.h>
+          #include <signal.h>
           #include <errno.h>
           #include <sys/mman.h>
           #include <sys/stat.h>
           #include <gnu/libc-version.h>
+          #include <execinfo.h>
 
           #define PAGE 4096u
           #define MAXMOD 4
@@ -68,6 +70,19 @@ jobs:
             va_list ap;
             va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap); fflush(stdout);
             if (g_log) { va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap); fflush(g_log); }
+          }
+
+          static void segfault_handler(int sig) {
+            L("\n[CRASH] Terjadi Segmentation Fault (Signal %d)!\n", sig);
+            void *trace[32];
+            int size = backtrace(trace, 32);
+            char **messages = backtrace_symbols(trace, size);
+            for (int i = 0; i < size; i++) {
+              L("[bt] %s\n", messages[i]);
+            }
+            free(messages);
+            if (g_log) fclose(g_log);
+            exit(1);
           }
 
           typedef struct {
@@ -270,13 +285,14 @@ jobs:
             int i;
             if (m->init) {
               void (*init_func)(void) = (void (*)(void))(m->bias + m->init);
-              L("[init] Menjalankan DT_INIT untuk %s...\n", m->name);
+              L("[init] Menjalankan DT_INIT (%p) untuk %s...\n", init_func, m->name);
               init_func();
             }
             if (m->iarr) {
               for (i = 0; i < (int)m->niarr; i++) {
                 if (m->iarr[i] && m->iarr[i] != (uint32_t)-1) {
                   void (*arr_func)(void) = (void (*)(void))(m->bias + m->iarr[i]);
+                  L("[init-arr] Menjalankan DT_INIT_ARRAY[%d] (%p) untuk %s...\n", i, arr_func, m->name);
                   arr_func();
                 }
               }
@@ -284,9 +300,12 @@ jobs:
           }
 
           int main(int argc, char **argv) {
+            signal(SIGSEGV, segfault_handler);
+            signal(SIGABRT, segfault_handler);
+
             Mod *fm = NULL, *um = NULL;
             g_log = fopen("loader_log.txt", "w");
-            L("== Cordy Unity 3.5.4f1 Execution Loader (armhf) ==\n");
+            L("== Cordy Unity 3.5.4f1 Crash-Debug Loader (armhf) ==\n");
 
             init_bionic_tables();
 
