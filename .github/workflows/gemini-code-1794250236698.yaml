@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & Mono VM Hook
+      - name: Buat Source Code Custom ELF Loader & Mono JIT Execution
         run: |
           mkdir -p src out/cordy_android/libs
 
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader dengan Pencari Simbol Mono
+          # 2. Source Code Cordy Loader dengan Eksekusi mono_jit_init
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -287,7 +287,7 @@ jobs:
 
             Mod *fm = NULL, *um = NULL;
             g_log = fopen("loader_log.txt", "w");
-            L("== Cordy Unity 3.5.4f1 Mono Hook Loader (armhf) ==\n");
+            L("== Cordy Unity 3.5.4f1 JIT Executor (armhf) ==\n");
 
             init_bionic_tables();
 
@@ -301,15 +301,17 @@ jobs:
             if (load_mod("libs", "libunity.so", &um) != 0) return 1;
             relocate(um);
 
-            /* Cek simbol mono_jit_init di libmono.so */
             void *p_mono_init = mod_find(fm, "mono_jit_init");
             if (p_mono_init) {
-              L("[mono] Ditemukan simbol mono_jit_init di alamat: %p\n", p_mono_init);
+              L("[mono] Menjalankan mono_jit_init untuk Cordy...\n");
+              void *(*mono_jit_init)(const char *) = (void *(*)(const char *))p_mono_init;
+              void *domain = mono_jit_init("CordyDomain");
+              L("[mono] Domain VM berhasil diinisialisasi di: %p\n", domain);
             } else {
-              L("[mono] Peringatan: mono_jit_init tidak ditemukan langsung di tabel simbol.\n");
+              L("[mono] Error: mono_jit_init tidak ditemukan.\n");
             }
 
-            L("SUKSES: Seluruh modul Unity & Mono siap diinisialisasi!\n");
+            L("SUKSES: Eksekusi VM Mono selesai!\n");
             if (g_log) fclose(g_log);
             return 0;
           }
@@ -336,31 +338,4 @@ jobs:
 
           cd "$GAMEDIR" || exit 1
 
-          export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
-          chmod +x ./cordyloader 2>/dev/null
-
-          rm -f loader_stdout.txt loader_log.txt
-          ./cordyloader > loader_stdout.txt 2>&1
-          echo "exit code: $?" >> loader_stdout.txt
-          sleep 2
-          type pm_finish >/dev/null 2>&1 && pm_finish
-          EOF_SH
-          chmod +x out/CordyLoader.sh
-
-      - name: Build Stub & Kompilasi Binary
-        run: |
-          cd src && python3 gen_unity_stubs.py && cd ..
-          arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
-
-          MAXV=$(arm-linux-gnueabihf-readelf -V out/cordy_android/cordyloader | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
-          echo "Cordyloader butuh GLIBC tertinggi: $MAXV (device: 2.37)"
-          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
-            echo "GAGAL: Membutuhkan glibc melebihi 2.37!"
-            exit 1
-          fi
-
-      - name: Upload Artifact Build Cordy
-        uses: actions/upload-artifact@v4
-        with:
-          name: cordy-loader-armhf
-          path: out
+          export LD_LIBRARY_PATH="$GAMEDIR/libs:/
