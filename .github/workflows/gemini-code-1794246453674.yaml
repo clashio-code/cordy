@@ -1,0 +1,183 @@
+name: build-armhf-cordy-loader
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang toolchain ARM 32-bit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - name: Buat Source Code Loader & Shim Cordy
+        run: |
+          mkdir -p src out/cordy_android/libs
+
+          # 1. Generator Stub JNI Unity (UnityPlayer & Native Calls)
+          cat > src/gen_unity_stubs.py <<'EOF_PY'
+          import sys
+
+          unity_classes = [
+              "com/unity3d/player/UnityPlayer",
+              "com/unity3d/player/PlayerPrefs",
+              "org/fmod/FMODAudioDevice",
+              "com/unity3d/player/UnityJavaRunnable",
+              "android/os/SystemClock",
+              "android/os/Build$VERSION",
+              "java/util/HashMap",
+              "android/os/Build",
+              "java/util/Locale",
+              "android/view/KeyCharacterMap",
+              "java/lang/Object",
+              "com/unity3d/player/ReflectionHelper"
+          ]
+
+          # Generate array stub JNI 256 slot
+          o = []
+          o.append("static const char *const jni_names[256] = {")
+          for k in range(256):
+              o.append(f'  "slot_{k}",')
+          o.append("};")
+
+          for k in range(256):
+              o.append(f"static int jstub_{k}(void) {{ return jni_trap({k}); }}")
+
+          o.append("static void *const jstubs[256] = {")
+          o.append("  " + ", ".join(f"(void *)jstub_{k}" for k in range(256)))
+          o.append("};")
+
+          with open("stubs.inc", "w") as f:
+              f.write("\n".join(o) + "\n")
+          print("stubs.inc berhasil dibuat!")
+          EOF_PY
+
+          # 2. Source Code Utama Cordy Loader (armhf)
+          cat > src/cordyloader.c <<'EOF_C'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <setjmp.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <pthread.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <gnu/libc-version.h>
+
+          /* ================= SHIM SHA1 (Missing Symbols) ================= */
+          typedef struct {
+            uint32_t state[5];
+            uint32_t count[2];
+            unsigned char buffer[64];
+          } SHA1_CTX;
+
+          void SHA1Init(SHA1_CTX *context) {
+            if (!context) return;
+            context->state[0] = 0x67452301;
+            context->state[1] = 0xEFCDAB89;
+            context->state[2] = 0x98BADCFE;
+            context->state[3] = 0x10325476;
+            context->state[4] = 0xC3D2E1F0;
+            context->count[0] = context->count[1] = 0;
+          }
+
+          void SHA1Update(SHA1_CTX *context, const unsigned char *data, unsigned int len) {
+            /* Dummy update / passthrough stub */
+            (void)context; (void)data; (void)len;
+          }
+
+          void SHA1Final(unsigned char digest[20], SHA1_CTX *context) {
+            if (digest) memset(digest, 0, 20);
+            (void)context;
+          }
+
+          /* ================= SHIM sigsetjmp & atexit ================= */
+          int b_sigsetjmp(sigjmp_buf env, int savesigs) {
+            return sigsetjmp(env, savesigs);
+          }
+
+          int b_atexit(void (*func)(void)) {
+            return atexit(func);
+          }
+
+          static int jni_trap(int slot) {
+            printf("[JNI TRAP] Slot %d dipanggil oleh Unity, stub aman.\n", slot);
+            return 0;
+          }
+
+          #include "stubs.inc"
+
+          int main(int argc, char **argv) {
+            printf("== Cordy Unity 3.5.4f1 Loader (armhf) ==\n");
+            printf("Glibc Target: %s\n", gnu_get_libc_version());
+
+            void *h_unity = dlopen("libs/libunity.so", RTLD_NOW | RTLD_GLOBAL);
+            if (!h_unity) {
+              printf("GAGAL memuat libunity.so: %s\n", dlerror());
+              return 1;
+            }
+
+            void *h_mono = dlopen("libs/libmono.so", RTLD_NOW | RTLD_GLOBAL);
+            if (!h_mono) {
+              printf("GAGAL memuat libmono.so: %s\n", dlerror());
+              return 1;
+            }
+
+            printf("Berhasil memuat libunity.so dan libmono.so!\n");
+            return 0;
+          }
+          EOF_C
+
+          # 3. Skrip Peluncur Cordy (PortMaster standard)
+          cat > out/CordyLoader.sh <<'EOF_SH'
+          #!/bin/bash
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/cordy_android"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/cordy_android"
+
+          cd "$GAMEDIR" || exit 1
+
+          export LD_LIBRARY_PATH="/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
+          chmod +x ./cordyloader 2>/dev/null
+
+          ./cordyloader > loader_stdout.txt 2>&1
+          echo "exit code: $?" >> loader_stdout.txt
+          EOF_SH
+          chmod +x out/CordyLoader.sh
+
+      - name: Build Stub & Kompilasi Binary
+        run: |
+          cd src && python3 gen_unity_stubs.py && cd ..
+          arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
+
+          # Validasi versi Glibc (maksimal 2.37)
+          MAXV=$(arm-linux-gnueabihf-readelf -V out/cordy_android/cordyloader | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "Cordyloader butuh GLIBC tertinggi: $MAXV (device: 2.37)"
+          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+            echo "GAGAL: Membutuhkan glibc melebihi 2.37!"
+            exit 1
+          fi
+
+      - name: Upload Artifact Build Cordy
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordy-loader-armhf
+          path: out
