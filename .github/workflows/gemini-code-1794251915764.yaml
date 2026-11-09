@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & JNI_OnLoad Hook
+      - name: Buat Source Code Custom ELF Loader & Fake JNI Environment
         run: |
           mkdir -p src out/cordy_android/libs
 
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader dengan JNI_OnLoad Hook
+          # 2. Source Code Cordy Loader dengan Fake JNIVM & JNIEnv
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -101,6 +101,46 @@ jobs:
           }
 
           #include "stubs.inc"
+
+          /* --- FAKE JNI ENVIRONMENT STUBS --- */
+          static void *fake_jnienv[512];
+          static void *fake_javavm[16];
+
+          static int fake_GetEnv(void *vm, void **env, int version) {
+            *env = fake_jnienv;
+            return 0;
+          }
+
+          static int fake_AttachCurrentThread(void *vm, void **env, void *thr_args) {
+            *env = fake_jnienv;
+            return 0;
+          }
+
+          static void *fake_JNI_FindClass(void *env, const char *name) {
+            L("[jni] FindClass requested: %s\n", name ? name : "?");
+            return (void *)0x12345678; // Dummy class pointer
+          }
+
+          static int fake_JNI_GeneralInt(void *env, ...) {
+            return 0;
+          }
+
+          static void *fake_JNI_GeneralPtr(void *env, ...) {
+            return NULL;
+          }
+
+          static void init_fake_jni(void) {
+            // Setup JavaVM table
+            fake_javavm[3] = fake_GetEnv;
+            fake_javavm[4] = fake_AttachCurrentThread;
+
+            // Setup JNIEnv table (mengisi beberapa slot fungsi JNI umum)
+            for (int i = 0; i < 512; i++) {
+              fake_jnienv[i] = fake_JNI_GeneralPtr;
+            }
+            fake_jnienv[6] = fake_JNI_FindClass; // FindClass biasanya ada di indeks tertentu, kita isi aman
+          /* ---------------------------------- */
+          }
 
           static char bionic_ctype[1 + 256];
           static int16_t bionic_tolower[1 + 256], bionic_toupper[1 + 256];
@@ -252,72 +292,9 @@ jobs:
             L("== Cordy Render Loop Launcher ==\n");
 
             init_bionic_tables();
+            init_fake_jni();
             dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
             h_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
             h_zlib = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
 
-            if (load_mod("libs", "libmono.so", &fm) != 0) return 1;
-            relocate(fm);
-            if (load_mod("libs", "libunity.so", &um) != 0) return 1;
-            relocate(um);
-
-            L("[init] Modul siap dijalankan.\n");
-
-            /* Panggil JNI_OnLoad libunity untuk memicu inisialisasi mesin Unity */
-            typedef int (*jni_onload_t)(void *, void *);
-            jni_onload_t p_onload = (jni_onload_t)mod_find(um, "JNI_OnLoad");
-            if (p_onload) {
-              L("[init] Memanggil JNI_OnLoad di %p...\n", p_onload);
-              p_onload(NULL, NULL);
-              L("[init] JNI_OnLoad selesai dieksekusi.\n");
-            } else {
-              L("[init] Peringatan: JNI_OnLoad tidak ditemukan di libunity.so\n");
-            }
-
-            L("SUKSES: Loader utama Berjalan!\n");
-            if (g_log) fclose(g_log);
-            return 0;
-          }
-          EOF_C
-
-          # 3. Skrip PortMaster dengan Auto-copy Assets
-          cat > out/CordyLoader.sh <<'EOF_SH'
-          #!/bin/bash
-          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
-          if [ -d "/opt/system/Tools/PortMaster/" ]; then
-            controlfolder="/opt/system/Tools/PortMaster"
-          elif [ -d "/opt/tools/PortMaster/" ]; then
-            controlfolder="/opt/tools/PortMaster"
-          else
-            controlfolder="/roms/ports/PortMaster"
-          fi
-          source $controlfolder/control.txt
-          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
-          GAMEDIR="/$directory/ports/cordy_android"
-          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/cordy_android"
-          cd "$GAMEDIR" || exit 1
-
-          if [ -d "assets" ]; then
-            cp -rf assets/* ./
-          fi
-
-          export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
-          chmod +x ./cordyloader 2>/dev/null
-          rm -f loader_stdout.txt loader_log.txt
-          ./cordyloader > loader_stdout.txt 2>&1
-          echo "exit code: $?" >> loader_stdout.txt
-          sleep 2
-          type pm_finish >/dev/null 2>&1 && pm_finish
-          EOF_SH
-          chmod +x out/CordyLoader.sh
-
-      - name: Build & Kompilasi
-        run: |
-          cd src && python3 gen_unity_stubs.py && cd ..
-          arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cordy-loader-armhf
-          path: out
+            if (load_mod("libs", "libmono.so
