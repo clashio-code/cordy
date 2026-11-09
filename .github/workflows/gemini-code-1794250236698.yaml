@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & Safe Init Bypass
+      - name: Buat Source Code Custom ELF Loader & Mono VM Hook
         run: |
           mkdir -p src out/cordy_android/libs
 
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader (Bypass Init Array libunity yang crash)
+          # 2. Source Code Cordy Loader dengan Pencari Simbol Mono
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -257,7 +257,7 @@ jobs:
               for (i = 0; i < eh->e_shnum; i++) if (sh[i].sh_type == SHT_DYNSYM) m->nsym = (int)(sh[i].sh_size / sizeof(Elf32_Sym));
             }
             nmods++; *out = m;
-            L("[load] %s sukses\n", name);
+            L("[load] %s sukses (bias=%p)\n", name, (void *)m->bias);
             return 0;
           }
 
@@ -287,7 +287,7 @@ jobs:
 
             Mod *fm = NULL, *um = NULL;
             g_log = fopen("loader_log.txt", "w");
-            L("== Cordy Unity 3.5.4f1 Safe Linker (armhf) ==\n");
+            L("== Cordy Unity 3.5.4f1 Mono Hook Loader (armhf) ==\n");
 
             init_bionic_tables();
 
@@ -301,7 +301,15 @@ jobs:
             if (load_mod("libs", "libunity.so", &um) != 0) return 1;
             relocate(um);
 
-            L("SUKSES: libmono.so dan libunity.so berhasil dimuat & direlokasi dengan aman!\n");
+            /* Cek simbol mono_jit_init di libmono.so */
+            void *p_mono_init = mod_find(fm, "mono_jit_init");
+            if (p_mono_init) {
+              L("[mono] Ditemukan simbol mono_jit_init di alamat: %p\n", p_mono_init);
+            } else {
+              L("[mono] Peringatan: mono_jit_init tidak ditemukan langsung di tabel simbol.\n");
+            }
+
+            L("SUKSES: Seluruh modul Unity & Mono siap diinisialisasi!\n");
             if (g_log) fclose(g_log);
             return 0;
           }
