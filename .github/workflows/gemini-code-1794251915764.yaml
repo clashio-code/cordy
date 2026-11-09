@@ -331,4 +331,44 @@ jobs:
           }
           EOF_C
 
-          # 3
+          # 3. Skrip PortMaster dengan Auto-copy Assets
+          cat > out/CordyLoader.sh <<'EOF_SH'
+          #!/bin/bash
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+          GAMEDIR="/$directory/ports/cordy_android"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/cordy_android"
+          cd "$GAMEDIR" || exit 1
+
+          if [ -d "assets" ]; then
+            cp -rf assets/* ./
+          fi
+
+          export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
+          chmod +x ./cordyloader 2>/dev/null
+          rm -f loader_stdout.txt loader_log.txt
+          ./cordyloader > loader_stdout.txt 2>&1
+          echo "exit code: $?" >> loader_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH
+          chmod +x out/CordyLoader.sh
+
+      - name: Build & Kompilasi
+        run: |
+          cd src && python3 gen_unity_stubs.py && cd ..
+          arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordy-loader-armhf
+          path: out
