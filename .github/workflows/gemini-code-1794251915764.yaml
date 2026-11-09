@@ -22,7 +22,7 @@ jobs:
           o = []
           o.append("static const char *const jni_names[256] = {")
           for k in range(256):
-              o.append(f'  "slot_{k}",')
+              o.append(f'  "slot_{k},')
           o.append("};")
 
           for k in range(256):
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader dengan Fake JNIVM & JNIEnv
+          # 2. Source Code Cordy Loader dengan Fake JNIVM & JNIEnv yang Lengkap
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -67,37 +67,37 @@ jobs:
           static void *h_gles, *h_zlib;
 
           static void L(const char *fmt, ...) {
-            va_list ap;
-            va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap); fflush(stdout);
-            if (g_log) { va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap); fflush(g_log); }
+              va_list ap;
+              va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap); fflush(stdout);
+              if (g_log) { va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap); fflush(g_log); }
           }
 
           static void segfault_handler(int sig) {
-            L("\n[CRASH] Terjadi Segmentation Fault (Signal %d)!\n", sig);
-            void *trace[32];
-            int size = backtrace(trace, 32);
-            char **messages = backtrace_symbols(trace, size);
-            for (int i = 0; i < size; i++) {
-              L("[bt] %s\n", messages[i]);
-            }
-            free(messages);
-            if (g_log) fclose(g_log);
-            exit(1);
+              L("\n[CRASH] Terjadi Segmentation Fault (Signal %d)!\n", sig);
+              void *trace[32];
+              int size = backtrace(trace, 32);
+              char **messages = backtrace_symbols(trace, size);
+              for (int i = 0; i < size; i++) {
+                  L("[bt] %s\n", messages[i]);
+              }
+              free(messages);
+              if (g_log) fclose(g_log);
+              exit(1);
           }
 
           typedef struct {
-            char name[64];
-            uint8_t *file; size_t fsize;
-            uint8_t *base; size_t span; uintptr_t bias;
-            Elf32_Sym *sym; int nsym; const char *str;
-            Elf32_Rel *rel; uint32_t nrel; Elf32_Rel *jrel; uint32_t njrel;
+              char name[64];
+              uint8_t *file; size_t fsize;
+              uint8_t *base; size_t span; uintptr_t bias;
+              Elf32_Sym *sym; int nsym; const char *str;
+              Elf32_Rel *rel; uint32_t nrel; Elf32_Rel *jrel; uint32_t njrel;
           } Mod;
 
           static Mod mods[MAXMOD];
           static int nmods;
 
           static int jni_trap(int slot) {
-            return 0;
+              return 0;
           }
 
           #include "stubs.inc"
@@ -106,40 +106,50 @@ jobs:
           static void *fake_jnienv[512];
           static void *fake_javavm[16];
 
-          static int fake_GetEnv(void *vm, void **env, int version) {
-            *env = fake_jnienv;
-            return 0;
-          }
-
-          static int fake_AttachCurrentThread(void *vm, void **env, void *thr_args) {
-            *env = fake_jnienv;
-            return 0;
-          }
-
-          static void *fake_JNI_FindClass(void *env, const char *name) {
-            L("[jni] FindClass requested: %s\n", name ? name : "?");
-            return (void *)0x12345678; // Dummy class pointer
-          }
-
           static int fake_JNI_GeneralInt(void *env, ...) {
-            return 0;
+              return 0;
           }
 
           static void *fake_JNI_GeneralPtr(void *env, ...) {
-            return NULL;
+              return NULL;
+          }
+
+          static int fake_GetEnv(void *vm, void **env, int version) {
+              *env = fake_jnienv;
+              return 0;
+          }
+
+          static int fake_AttachCurrentThread(void *vm, void **env, void *thr_args) {
+              *env = fake_jnienv;
+              return 0;
+          }
+
+          static int fake_DetachCurrentThread(void *vm) {
+              return 0;
+          }
+
+          static void *fake_JNI_FindClass(void *env, const char *name) {
+              L("[jni] FindClass requested: %s\n", name ? name : "?");
+              return (void *)0x12345678; // Dummy class pointer
           }
 
           static void init_fake_jni(void) {
-            // Setup JavaVM table
-            fake_javavm[3] = fake_GetEnv;
-            fake_javavm[4] = fake_AttachCurrentThread;
+              // Setup JavaVM function table secara lengkap agar tidak null-dereference
+              for (int i = 0; i < 16; i++) {
+                  fake_javavm[i] = fake_JNI_GeneralPtr;
+              }
+              fake_javavm[0] = fake_JNI_GeneralPtr;         // Reserved / DestroyJavaVM
+              fake_javavm[1] = fake_AttachCurrentThread;    // AttachCurrentThread
+              fake_javavm[2] = fake_DetachCurrentThread;    // DetachCurrentThread
+              fake_javavm[3] = fake_GetEnv;                 // GetEnv
+              fake_javavm[4] = fake_AttachCurrentThread;    // AttachCurrentThreadAsDaemon
 
-            // Setup JNIEnv table (mengisi beberapa slot fungsi JNI umum)
-            for (int i = 0; i < 512; i++) {
-              fake_jnienv[i] = fake_JNI_GeneralPtr;
-            }
-            fake_jnienv[6] = fake_JNI_FindClass; // FindClass biasanya ada di indeks tertentu, kita isi aman
-          /* ---------------------------------- */
+              // Setup JNIEnv function table
+              for (int i = 0; i < 512; i++) {
+                  fake_jnienv[i] = fake_JNI_GeneralPtr;
+              }
+              fake_jnienv[4] = fake_JNI_FindClass;          // FindClass slot utama
+              fake_jnienv[6] = fake_JNI_FindClass;          // Alternatif slot FindClass
           }
 
           static char bionic_ctype[1 + 256];
@@ -149,216 +159,176 @@ jobs:
           static char bionic_sF[3 * 84];
 
           static void init_bionic_tables(void) {
-            int c;
-            bionic_ctype[0] = 0; bionic_tolower[0] = -1; bionic_toupper[0] = -1;
-            for (c = 0; c < 256; c++) {
-              bionic_ctype[1 + c] = 0;
-              bionic_tolower[1 + c] = (int16_t)((c >= 'A' && c <= 'Z') ? c + 32 : c);
-              bionic_toupper[1 + c] = (int16_t)((c >= 'a' && c <= 'z') ? c - 32 : c);
-            }
+              int c;
+              bionic_ctype[0] = 0; bionic_tolower[0] = -1; bionic_toupper[0] = -1;
+              for (c = 0; c < 256; c++) {
+                  bionic_ctype[1 + c] = 0;
+                  bionic_tolower[1 + c] = (int16_t)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+                  bionic_toupper[1 + c] = (int16_t)((c >= 'a' && c <= 'z') ? c - 32 : c);
+              }
           }
 
           static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
-            char buf[1024]; va_list ap;
-            va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap); va_end(ap);
-            L("[droid-log %d/%s] %s\n", prio, tag ? tag : "?", buf);
-            return 1;
+              char buf[1024]; va_list ap;
+              va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap); va_end(ap);
+              L("[droid-log %d/%s] %s\n", prio, tag ? tag : "?", buf);
+              return 1;
           }
 
           static int *b_errno(void) { return &errno; }
           static size_t b_strlcpy(char *dst, const char *src, size_t size) {
-            size_t srclen = strlen(src);
-            if (size > 0) {
-              size_t copylen = srclen >= size ? size - 1 : srclen;
-              memcpy(dst, src, copylen);
-              dst[copylen] = '\0';
-            }
-            return srclen;
+              size_t srclen = strlen(src);
+              if (size > 0) {
+                  size_t copylen = srclen >= size ? size - 1 : srclen;
+                  memcpy(dst, src, copylen);
+                  dst[copylen] = '\0';
+              }
+              return srclen;
           }
 
           static void *mod_find(const Mod *m, const char *name) {
-            int i;
-            if (!m || !m->sym || !m->str) return NULL;
-            for (i = 1; i < m->nsym; i++) {
-              const Elf32_Sym *s = &m->sym[i];
-              if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(m->str + s->st_name, name) == 0) return (void *)(m->bias + s->st_value);
-            }
-            return NULL;
+              int i;
+              if (!m || !m->sym || !m->str) return NULL;
+              for (i = 1; i < m->nsym; i++) {
+                  const Elf32_Sym *s = &m->sym[i];
+                  if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(m->str + s->st_name, name) == 0) return (void *)(m->bias + s->st_value);
+              }
+              return NULL;
           }
 
           static uint32_t resolve(const Mod *self, const Elf32_Sym *s) {
-            const char *n = self->str + s->st_name;
-            int i; void *p;
-            if (s->st_shndx != SHN_UNDEF) return U32(self->bias + s->st_value);
-            for (i = 0; i < nmods; i++) if (&mods[i] != self && (p = mod_find(&mods[i], n))) return U32(p);
-            
-            if (strcmp(n, "__errno") == 0) return U32(b_errno);
-            if (strcmp(n, "__android_log_print") == 0) return U32(b_android_log_print);
-            if (strcmp(n, "strlcpy") == 0) return U32(b_strlcpy);
-            if (strcmp(n, "sigsetjmp") == 0) return U32(_setjmp);
-            if (strcmp(n, "atexit") == 0) return U32(atexit);
-            if (strcmp(n, "__sF") == 0) return U32(bionic_sF);
-            if (strcmp(n, "_ctype_") == 0) return U32(&p_ctype);
-            if (strcmp(n, "_tolower_tab_") == 0) return U32(&p_tolower);
-            if (strcmp(n, "_toupper_tab_") == 0) return U32(&p_toupper);
-            if (strcmp(n, "__page_size") == 0) return 4096;
+              const char *n = self->str + s->st_name;
+              int i; void *p;
+              if (s->st_shndx != SHN_UNDEF) return U32(self->bias + s->st_value);
+              for (i = 0; i < nmods; i++) if (&mods[i] != self && (p = mod_find(&mods[i], n))) return U32(p);
+              
+              if (strcmp(n, "__errno") == 0) return U32(b_errno);
+              if (strcmp(n, "__android_log_print") == 0) return U32(b_android_log_print);
+              if (strcmp(n, "strlcpy") == 0) return U32(b_strlcpy);
+              if (strcmp(n, "sigsetjmp") == 0) return U32(_setjmp);
+              if (strcmp(n, "atexit") == 0) return U32(atexit);
+              if (strcmp(n, "__sF") == 0) return U32(bionic_sF);
+              if (strcmp(n, "_ctype_") == 0) return U32(&p_ctype);
+              if (strcmp(n, "_tolower_tab_") == 0) return U32(&p_tolower);
+              if (strcmp(n, "_toupper_tab_") == 0) return U32(&p_toupper);
+              if (strcmp(n, "__page_size") == 0) return 4096;
 
-            if (h_gles && (p = dlsym(h_gles, n))) return U32(p);
-            if (h_zlib && (p = dlsym(h_zlib, n))) return U32(p);
-            if ((p = dlsym(RTLD_DEFAULT, n))) return U32(p);
-            
-            return 0;
+              if (h_gles && (p = dlsym(h_gles, n))) return U32(p);
+              if (h_zlib && (p = dlsym(h_zlib, n))) return U32(p);
+              if ((p = dlsym(RTLD_DEFAULT, n))) return U32(p);
+              
+              return 0;
           }
 
           static int read_file(const char *path, uint8_t **buf, size_t *len) {
-            FILE *f = fopen(path, "rb"); long n;
-            if (!f) return -1;
-            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
-            *buf = malloc((size_t)n);
-            if (!*buf || fread(*buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); return -1; }
-            fclose(f); *len = (size_t)n;
-            return 0;
+              FILE *f = fopen(path, "rb"); long n;
+              if (!f) return -1;
+              fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+              *buf = malloc((size_t)n);
+              if (!*buf || fread(*buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); return -1; }
+              fclose(f); *len = (size_t)n;
+              return 0;
           }
 
           static int load_mod(const char *dir, const char *name, Mod **out) {
-            char path[512]; Mod *m; const Elf32_Ehdr *eh; const Elf32_Phdr *ph;
-            uint32_t minv = 0xFFFFFFFFu, maxv = 0; int i;
-            if (nmods >= MAXMOD) return -1;
-            m = &mods[nmods]; memset(m, 0, sizeof *m);
-            snprintf(m->name, sizeof m->name, "%s", name);
-            snprintf(path, sizeof path, "%s/%s", dir, name);
-            if (read_file(path, &m->file, &m->fsize) != 0) return -1;
-            eh = (const Elf32_Ehdr *)m->file;
-            ph = (const Elf32_Phdr *)(m->file + eh->e_phoff);
-            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
-              if (ph[i].p_vaddr < minv) minv = ph[i].p_vaddr;
-              if (ph[i].p_vaddr + ph[i].p_memsz > maxv) maxv = ph[i].p_vaddr + ph[i].p_memsz;
-            }
-            minv &= ~(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(PAGE - 1);
-            m->span = maxv - minv;
-            m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (m->base == MAP_FAILED) return -1;
-            m->bias = (uintptr_t)m->base - minv;
-            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
-              memcpy((void *)(m->bias + ph[i].p_vaddr), m->file + ph[i].p_offset, ph[i].p_filesz);
-            }
-            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_DYNAMIC) {
-              const Elf32_Dyn *d = (const Elf32_Dyn *)(m->bias + ph[i].p_vaddr);
-              for (; d->d_tag != DT_NULL; d++) {
-                switch (d->d_tag) {
-                  case DT_SYMTAB: m->sym = (Elf32_Sym *)(m->bias + d->d_un.d_ptr); break;
-                  case DT_STRTAB: m->str = (const char *)(m->bias + d->d_un.d_ptr); break;
-                  case DT_REL: m->rel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
-                  case DT_RELSZ: m->nrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
-                  case DT_JMPREL: m->jrel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
-                  case DT_PLTRELSZ: m->njrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
-                }
+              char path[512]; Mod *m; const Elf32_Ehdr *eh; const Elf32_Phdr *ph;
+              uint32_t minv = 0xFFFFFFFFu, maxv = 0; int i;
+              if (nmods >= MAXMOD) return -1;
+              m = &mods[nmods]; memset(m, 0, sizeof *m);
+              snprintf(m->name, sizeof m->name, "%s", name);
+              snprintf(path, sizeof path, "%s/%s", dir, name);
+              if (read_file(path, &m->file, &m->fsize) != 0) return -1;
+              eh = (const Elf32_Ehdr *)m->file;
+              ph = (const Elf32_Phdr *)(m->file + eh->e_phoff);
+              for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+                  if (ph[i].p_vaddr < minv) minv = ph[i].p_vaddr;
+                  if (ph[i].p_vaddr + ph[i].p_memsz > maxv) maxv = ph[i].p_vaddr + ph[i].p_memsz;
               }
-            }
-            if (eh->e_shoff && (size_t)eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf32_Shdr) <= m->fsize) {
-              const Elf32_Shdr *sh = (const Elf32_Shdr *)(m->file + eh->e_shoff);
-              for (i = 0; i < eh->e_shnum; i++) if (sh[i].sh_type == SHT_DYNSYM) m->nsym = (int)(sh[i].sh_size / sizeof(Elf32_Sym));
-            }
-            nmods++; *out = m;
-            return 0;
+              minv &= ~(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(PAGE - 1);
+              m->span = maxv - minv;
+              m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+              if (m->base == MAP_FAILED) return -1;
+              m->bias = (uintptr_t)m->base - minv;
+              for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+                  memcpy((void *)(m->bias + ph[i].p_vaddr), m->file + ph[i].p_offset, ph[i].p_filesz);
+              }
+              for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_DYNAMIC) {
+                  const Elf32_Dyn *d = (const Elf32_Dyn *)(m->bias + ph[i].p_vaddr);
+                  for (; d->d_tag != DT_NULL; d++) {
+                      switch (d->d_tag) {
+                          case DT_SYMTAB: m->sym = (Elf32_Sym *)(m->bias + d->d_un.d_ptr); break;
+                          case DT_STRTAB: m->str = (const char *)(m->bias + d->d_un.d_ptr); break;
+                          case DT_REL: m->rel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
+                          case DT_RELSZ: m->nrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
+                          case DT_JMPREL: m->jrel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
+                          case DT_PLTRELSZ: m->njrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
+                      }
+                  }
+              }
+              if (eh->e_shoff && (size_t)eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf32_Shdr) <= m->fsize) {
+                  const Elf32_Shdr *sh = (const Elf32_Shdr *)(m->file + eh->e_shoff);
+                  for (i = 0; i < eh->e_shnum; i++) if (sh[i].sh_type == SHT_DYNSYM) m->nsym = (int)(sh[i].sh_size / sizeof(Elf32_Sym));
+              }
+              nmods++; *out = m;
+              return 0;
           }
 
           static int relocate(Mod *m) {
-            int pass;
-            for (pass = 0; pass < 2; pass++) {
-              Elf32_Rel *r = pass ? m->jrel : m->rel;
-              uint32_t n = pass ? m->njrel : m->nrel, k;
-              for (k = 0; k < n; k++) {
-                uint32_t type = ELF32_R_TYPE(r[k].r_info), si = ELF32_R_SYM(r[k].r_info);
-                uint32_t *where = (uint32_t *)(m->bias + r[k].r_offset);
-                switch (type) {
-                  case R_ARM_NONE: break;
-                  case R_ARM_RELATIVE: *where += U32(m->bias); break;
-                  case R_ARM_ABS32: if (si) *where += resolve(m, &m->sym[si]); break;
-                  case R_ARM_GLOB_DAT: case R_ARM_JUMP_SLOT: *where = resolve(m, &m->sym[si]); break;
-                  default: break;
-                }
+              int pass;
+              for (pass = 0; pass < 2; pass++) {
+                  Elf32_Rel *r = pass ? m->jrel : m->rel;
+                  uint32_t n = pass ? m->njrel : m->nrel, k;
+                  for (k = 0; k < n; k++) {
+                      uint32_t type = ELF32_R_TYPE(r[k].r_info), si = ELF32_R_SYM(r[k].r_info);
+                      uint32_t *where = (uint32_t *)(m->bias + r[k].r_offset);
+                      switch (type) {
+                          case R_ARM_NONE: break;
+                          case R_ARM_RELATIVE: *where += U32(m->bias); break;
+                          case R_ARM_ABS32: if (si) *where += resolve(m, &m->sym[si]); break;
+                          case R_ARM_GLOB_DAT: case R_ARM_JUMP_SLOT: *where = resolve(m, &m->sym[si]); break;
+                          default: break;
+                      }
+                  }
               }
-            }
-            return 0;
+              return 0;
           }
 
           int main(int argc, char **argv) {
-            signal(SIGSEGV, segfault_handler);
-            signal(SIGABRT, segfault_handler);
+              signal(SIGSEGV, segfault_handler);
+              signal(SIGABRT, segfault_handler);
 
-            Mod *fm = NULL, *um = NULL;
-            g_log = fopen("loader_log.txt", "w");
-            L("== Cordy Render Loop Launcher ==\n");
+              Mod *fm = NULL, *um = NULL;
+              g_log = fopen("loader_log.txt", "w");
+              L("== Cordy Render Loop Launcher ==\n");
 
-            init_bionic_tables();
-            init_fake_jni();
-            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
-            h_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
-            h_zlib = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
+              init_bionic_tables();
+              init_fake_jni();
+              dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+              h_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
+              h_zlib = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
 
-            if (load_mod("libs", "libmono.so", &fm) != 0) return 1;
-            relocate(fm);
-            if (load_mod("libs", "libunity.so", &um) != 0) return 1;
-            relocate(um);
+              if (load_mod("libs", "libmono.so", &fm) != 0) return 1;
+              relocate(fm);
+              if (load_mod("libs", "libunity.so", &um) != 0) return 1;
+              relocate(um);
 
-            L("[init] Modul siap dijalankan.\n");
+              L("[init] Modul siap dijalankan.\n");
 
-            /* Panggil JNI_OnLoad dengan fake JavaVM pointer */
-            typedef int (*jni_onload_t)(void *, void *);
-            jni_onload_t p_onload = (jni_onload_t)mod_find(um, "JNI_OnLoad");
-            if (p_onload) {
-              L("[init] Memanggil JNI_OnLoad dengan fake JavaVM di %p...\n", p_onload);
-              p_onload(fake_javavm, NULL);
-              L("[init] JNI_OnLoad berhasil dieksekusi tanpa crash!\n");
-            } else {
-              L("[init] Peringatan: JNI_OnLoad tidak ditemukan di libunity.so\n");
-            }
+              /* Panggil JNI_OnLoad dengan fake JavaVM pointer */
+              typedef int (*jni_onload_t)(void *, void *);
+              jni_onload_t p_onload = (jni_onload_t)mod_find(um, "JNI_OnLoad");
+              if (p_onload) {
+                  L("[init] Memanggil JNI_OnLoad dengan fake JavaVM di %p...\n", p_onload);
+                  p_onload(fake_javavm, NULL);
+                  L("[init] JNI_OnLoad berhasil dieksekusi tanpa crash!\n");
+              } else {
+                  L("[init] Peringatan: JNI_OnLoad tidak ditemukan di libunity.so\n");
+              }
 
-            L("SUKSES: Loader utama Berjalan!\n");
-            if (g_log) fclose(g_log);
-            return 0;
+              L("SUKSES: Loader utama Berjalan!\n");
+              if (g_log) fclose(g_log);
+              return 0;
           }
           EOF_C
 
-          # 3. Skrip PortMaster dengan Auto-copy Assets
-          cat > out/CordyLoader.sh <<'EOF_SH'
-          #!/bin/bash
-          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
-          if [ -d "/opt/system/Tools/PortMaster/" ]; then
-            controlfolder="/opt/system/Tools/PortMaster"
-          elif [ -d "/opt/tools/PortMaster/" ]; then
-            controlfolder="/opt/tools/PortMaster"
-          else
-            controlfolder="/roms/ports/PortMaster"
-          fi
-          source $controlfolder/control.txt
-          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
-          GAMEDIR="/$directory/ports/cordy_android"
-          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/cordy_android"
-          cd "$GAMEDIR" || exit 1
-
-          if [ -d "assets" ]; then
-            cp -rf assets/* ./
-          fi
-
-          export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
-          chmod +x ./cordyloader 2>/dev/null
-          rm -f loader_stdout.txt loader_log.txt
-          ./cordyloader > loader_stdout.txt 2>&1
-          echo "exit code: $?" >> loader_stdout.txt
-          sleep 2
-          type pm_finish >/dev/null 2>&1 && pm_finish
-          EOF_SH
-          chmod +x out/CordyLoader.sh
-
-      - name: Build & Kompilasi
-        run: |
-          cd src && python3 gen_unity_stubs.py && cd ..
-          arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cordy-loader-armhf
-          path: out
+          # 3
