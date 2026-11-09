@@ -11,30 +11,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Loader & Shim Cordy
+      - name: Buat Source Code Loader & Shim Cordy (Unity 3.5.4f1)
         run: |
           mkdir -p src out/cordy_android/libs
 
-          # 1. Generator Stub JNI Unity (UnityPlayer & Native Calls)
+          # 1. Generator Stub JNI Unity
           cat > src/gen_unity_stubs.py <<'EOF_PY'
           import sys
 
-          unity_classes = [
-              "com/unity3d/player/UnityPlayer",
-              "com/unity3d/player/PlayerPrefs",
-              "org/fmod/FMODAudioDevice",
-              "com/unity3d/player/UnityJavaRunnable",
-              "android/os/SystemClock",
-              "android/os/Build$VERSION",
-              "java/util/HashMap",
-              "android/os/Build",
-              "java/util/Locale",
-              "android/view/KeyCharacterMap",
-              "java/lang/Object",
-              "com/unity3d/player/ReflectionHelper"
-          ]
-
-          # Generate array stub JNI 256 slot
           o = []
           o.append("static const char *const jni_names[256] = {")
           for k in range(256):
@@ -53,7 +37,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Utama Cordy Loader (armhf)
+          # 2. Source Code Utama Cordy Loader dengan Bionic Shim (liblog, SHA1, dll)
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -66,11 +50,32 @@ jobs:
           #include <fcntl.h>
           #include <unistd.h>
           #include <pthread.h>
+          #include <errno.h>
           #include <sys/mman.h>
           #include <sys/stat.h>
           #include <gnu/libc-version.h>
 
-          /* ================= SHIM SHA1 (Missing Symbols) ================= */
+          /* ================= SHIM ANDROID LOG ================= */
+          static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
+            char buf[1024];
+            va_list ap;
+            va_start(ap, fmt);
+            vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap);
+            va_end(ap);
+            printf("[droid-log %d/%s] %s\n", prio, tag ? tag : "?", buf);
+            return 1;
+          }
+
+          static int b_android_log_write(int prio, const char *tag, const char *text) {
+            printf("[droid-log %d/%s] %s\n", prio, tag ? tag : "?", text ? text : "");
+            return 1;
+          }
+
+          static int *b_errno(void) {
+            return &errno;
+          }
+
+          /* ================= SHIM SHA1 ================= */
           typedef struct {
             uint32_t state[5];
             uint32_t count[2];
@@ -88,7 +93,6 @@ jobs:
           }
 
           void SHA1Update(SHA1_CTX *context, const unsigned char *data, unsigned int len) {
-            /* Dummy update / passthrough stub */
             (void)context; (void)data; (void)len;
           }
 
@@ -97,7 +101,6 @@ jobs:
             (void)context;
           }
 
-          /* ================= SHIM sigsetjmp & atexit ================= */
           int b_sigsetjmp(sigjmp_buf env, int savesigs) {
             return sigsetjmp(env, savesigs);
           }
@@ -107,17 +110,38 @@ jobs:
           }
 
           static int jni_trap(int slot) {
-            printf("[JNI TRAP] Slot %d dipanggil oleh Unity, stub aman.\n", slot);
+            printf("[JNI TRAP] Slot %d dipanggil.\n", slot);
             return 0;
           }
 
           #include "stubs.inc"
 
+          /* Intercept dlopen untuk memalsukan liblog.so yang dicari libmono */
+          static void *b_dlopen(const char *filename, int flag) {
+            if (filename && strstr(filename, "liblog.so")) {
+              printf("[shim] dlopen(\"liblog.so\") dipalsukan ke dirinya sendiri.\n");
+              return dlopen(NULL, flag);
+            }
+            return dlopen(filename, flag);
+          }
+
+          static void *b_dlsym(void *handle, const char *symbol) {
+            if (strcmp(symbol, "__android_log_print") == 0) return (void *)b_android_log_print;
+            if (strcmp(symbol, "__android_log_write") == 0) return (void *)b_android_log_write;
+            if (strcmp(symbol, "__errno") == 0) return (void *)b_errno;
+            if (strcmp(symbol, "SHA1Init") == 0) return (void *)SHA1Init;
+            if (strcmp(symbol, "SHA1Update") == 0) return (void *)SHA1Update;
+            if (strcmp(symbol, "SHA1Final") == 0) return (void *)SHA1Final;
+            return dlsym(handle, symbol);
+          }
+
           int main(int argc, char **argv) {
             printf("== Cordy Unity 3.5.4f1 Loader (armhf) ==\n");
             printf("Glibc Target: %s\n", gnu_get_libc_version());
 
-            /* Load libmono.so DULU karena libunity bergantung padanya */
+            /* Override global symbol agar dlsym bisa menangkap shim bionic kita */
+            dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+
             void *h_mono = dlopen("libs/libmono.so", RTLD_NOW | RTLD_GLOBAL);
             if (!h_mono) {
               printf("GAGAL memuat libmono.so: %s\n", dlerror());
@@ -130,12 +154,12 @@ jobs:
               return 1;
             }
 
-            printf("Berhasil memuat libmono.so dan libunity.so!\n");
+            printf("SUKSES: libmono.so dan libunity.so berhasil dimuat!\n");
             return 0;
           }
           EOF_C
 
-          # 3. Skrip Peluncur Cordy (PortMaster standard dengan LD_LIBRARY_PATH lokal)
+          # 3. Skrip Peluncur Cordy
           cat > out/CordyLoader.sh <<'EOF_SH'
           #!/bin/bash
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -159,8 +183,11 @@ jobs:
           export LD_LIBRARY_PATH="$GAMEDIR/libs:/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
           chmod +x ./cordyloader 2>/dev/null
 
+          rm -f loader_stdout.txt
           ./cordyloader > loader_stdout.txt 2>&1
           echo "exit code: $?" >> loader_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_SH
           chmod +x out/CordyLoader.sh
 
@@ -169,7 +196,6 @@ jobs:
           cd src && python3 gen_unity_stubs.py && cd ..
           arm-linux-gnueabihf-gcc -O2 -Wall -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
 
-          # Validasi versi Glibc (maksimal 2.37)
           MAXV=$(arm-linux-gnueabihf-readelf -V out/cordy_android/cordyloader | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
           echo "Cordyloader butuh GLIBC tertinggi: $MAXV (device: 2.37)"
           if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
