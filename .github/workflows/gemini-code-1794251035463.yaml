@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Buat Source Code Custom ELF Loader & Mono Dirs Setup
+      - name: Buat Source Code Custom ELF Loader & Step-by-Step Debug
         run: |
           mkdir -p src out/cordy_android/libs
 
@@ -38,7 +38,7 @@ jobs:
           print("stubs.inc berhasil dibuat!")
           EOF_PY
 
-          # 2. Source Code Cordy Loader dengan mono_set_dirs
+          # 2. Source Code Cordy Loader dengan Step Logging
           cat > src/cordyloader.c <<'EOF_C'
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -166,6 +166,7 @@ jobs:
 
           static void *mod_find(const Mod *m, const char *name) {
             int i;
+            if (!m || !m->sym || !m->str) return NULL;
             for (i = 1; i < m->nsym; i++) {
               const Elf32_Sym *s = &m->sym[i];
               if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(m->str + s->st_name, name) == 0) return (void *)(m->bias + s->st_value);
@@ -216,7 +217,7 @@ jobs:
 
           static int load_mod(const char *dir, const char *name, Mod **out) {
             char path[512]; Mod *m; const Elf32_Ehdr *eh; const Elf32_Phdr *ph;
-            uint32_t minv = 0xFFFFFFFFu, maxv = 0; int i, dyn_found = 0;
+            uint32_t minv = 0xFFFFFFFFu, maxv = 0; int i;
             if (nmods >= MAXMOD) return -1;
             m = &mods[nmods]; memset(m, 0, sizeof *m);
             snprintf(m->name, sizeof m->name, "%s", name);
@@ -230,14 +231,14 @@ jobs:
             }
             minv &= ~(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(PAGE - 1);
             m->span = maxv - minv;
-            m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (m->base == MAP_FAILED) return -1;
             m->bias = (uintptr_t)m->base - minv;
             for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
               memcpy((void *)(m->bias + ph[i].p_vaddr), m->file + ph[i].p_offset, ph[i].p_filesz);
             }
             for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_DYNAMIC) {
-              const Elf32_Dyn *d = (const Elf32_Dyn *)(m->bias + ph[i].p_vaddr); dyn_found = 1;
+              const Elf32_Dyn *d = (const Elf32_Dyn *)(m->bias + ph[i].p_vaddr);
               for (; d->d_tag != DT_NULL; d++) {
                 switch (d->d_tag) {
                   case DT_SYMTAB: m->sym = (Elf32_Sym *)(m->bias + d->d_un.d_ptr); break;
@@ -246,9 +247,6 @@ jobs:
                   case DT_RELSZ: m->nrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
                   case DT_JMPREL: m->jrel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
                   case DT_PLTRELSZ: m->njrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
-                  case DT_INIT: m->init = d->d_un.d_val; break;
-                  case DT_INIT_ARRAY: m->iarr = (uint32_t *)(m->bias + d->d_un.d_ptr); break;
-                  case DT_INIT_ARRAYSZ: m->niarr = d->d_un.d_val / 4; break;
                 }
               }
             }
@@ -287,7 +285,7 @@ jobs:
 
             Mod *fm = NULL, *um = NULL;
             g_log = fopen("loader_log.txt", "w");
-            L("== Cordy Unity 3.5.4f1 Safe JIT Init (armhf) ==\n");
+            L("== Cordy Step Debug (armhf) ==\n");
 
             init_bionic_tables();
 
@@ -295,31 +293,25 @@ jobs:
             h_gles = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
             h_zlib = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
 
+            L("[step] Memuat libmono.so...\n");
             if (load_mod("libs", "libmono.so", &fm) != 0) return 1;
+            L("[step] Merelokasi libmono.so...\n");
             relocate(fm);
 
+            L("[step] Memuat libunity.so...\n");
             if (load_mod("libs", "libunity.so", &um) != 0) return 1;
+            L("[step] Merelokasi libunity.so...\n");
             relocate(um);
 
-            /* Set directory config Mono sebelum JIT di-init */
-            void *p_set_dirs = mod_find(fm, "mono_set_dirs");
-            if (p_set_dirs) {
-              void (*mono_set_dirs)(const char *, const char *) = (void (*)(const char *, const char *))p_set_dirs;
-              mono_set_dirs("libs", "libs");
-              L("[mono] mono_set_dirs berhasil dipanggil.\n");
-            }
-
+            L("[step] Mencari simbol mono_jit_init...\n");
             void *p_mono_init = mod_find(fm, "mono_jit_init");
             if (p_mono_init) {
-              L("[mono] Menjalankan mono_jit_init untuk Cordy...\n");
-              void *(*mono_jit_init)(const char *) = (void *(*)(const char *))p_mono_init;
-              void *domain = mono_jit_init("CordyDomain");
-              L("[mono] Domain VM berhasil diinisialisasi di: %p\n", domain);
+              L("[mono] mono_jit_init ditemukan di %p\n", p_mono_init);
             } else {
-              L("[mono] Error: mono_jit_init tidak ditemukan.\n");
+              L("[mono] mono_jit_init tidak ditemukan.\n");
             }
 
-            L("SUKSES: Eksekusi VM Mono selesai!\n");
+            L("SUKSES: Debug step selesai tanpa crash!\n");
             if (g_log) fclose(g_log);
             return 0;
           }
