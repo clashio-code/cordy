@@ -1,4 +1,4 @@
-name: build-cordy-loader-m6-input-fix4
+name: build-cordy-loader-m6-input-fix5
 on:
   workflow_dispatch:
   push:
@@ -618,15 +618,32 @@ jobs:
           /* ---- viewport fix: paksa viewport layar penuh HANYA untuk framebuffer utama (fb==0). Catat 40 panggilan pertama. ---- */
           static int g_sw, g_sh;   /* deklarasi awal; nilai asli (640x480) ada di bagian SDL */
           static int g_vp_n;
-          static void (*r_glViewport)(int, int, int, int);
           static void (*r_glGetIntegerv)(unsigned, int *);
-          static void b_glViewport(int x, int y, int w, int h) {
+          /* catat nilai viewport/scissor UNIK (maks 120) supaya terlihat apa yang dipasang Unity untuk layar utama */
+          static int vp_tab[120][6], vp_nt;
+          static void vp_seen(int kind, int x, int y, int w, int h, int fb) {
+            int i;
+            for (i = 0; i < vp_nt; i++) if (vp_tab[i][0] == kind && vp_tab[i][1] == x && vp_tab[i][2] == y && vp_tab[i][3] == w && vp_tab[i][4] == h && vp_tab[i][5] == fb) return;
+            if (vp_nt >= 120) return;
+            vp_tab[vp_nt][0] = kind; vp_tab[vp_nt][1] = x; vp_tab[vp_nt][2] = y; vp_tab[vp_nt][3] = w; vp_tab[vp_nt][4] = h; vp_tab[vp_nt][5] = fb; vp_nt++;
+            L("[gl] BARU %s(%d,%d,%d,%d) fb=%d\n", kind ? "glScissor" : "glViewport", x, y, w, h, fb);
+          }
+          static void (*r_glScissor)(int, int, int, int);
+          static void b_glScissor(int x, int y, int w, int h) {
+            int fb = -1;
+            if (!r_glScissor) *(void **)&r_glScissor = glsym("glScissor");
+            if (!r_glGetIntegerv) { void *q = NULL; if (h_gl2) q = dlsym(h_gl2, "glGetIntegerv"); if (!q && h_mali) q = dlsym(h_mali, "glGetIntegerv"); *(void **)&r_glGetIntegerv = q; }
+            if (r_glGetIntegerv) r_glGetIntegerv(0x8CA6, &fb);
+            vp_seen(1, x, y, w, h, fb);
+            r_glScissor(x, y, w, h);
+          }
+          static void (*r_glViewport)(int, int, int, int);
+                    static void b_glViewport(int x, int y, int w, int h) {
           int fb = -1;
           if (!r_glViewport) *(void **)&r_glViewport = glsym("glViewport");
           if (!r_glGetIntegerv) { void *q = NULL; if (h_gl2) q = dlsym(h_gl2, "glGetIntegerv"); if (!q && h_mali) q = dlsym(h_mali, "glGetIntegerv"); *(void **)&r_glGetIntegerv = q; }
           if (r_glGetIntegerv) r_glGetIntegerv(0x8CA6, &fb);   /* GL_FRAMEBUFFER_BINDING; -1 = query gagal -> jangan paksa */
-          if (g_vp_n++ < 40) L("[gl] glViewport(%d,%d,%d,%d) fb=%d\n", x, y, w, h, fb);
-          if (fb == 0 && g_sw > 0 && (x || y || w != g_sw || h != g_sh)) { x = 0; y = 0; w = g_sw; h = g_sh; }
+          vp_seen(0, x, y, w, h, fb);
           r_glViewport(x, y, w, h);
           }
           typedef void (*gl_ff4)(float, float, float, float);
@@ -788,7 +805,7 @@ jobs:
             SW(glMaterialf), SW(glTexParameterf), SW(glTexEnvf),
             S("ANativeWindow_fromSurface", b_ANativeWindow_fromSurface), S("ANativeWindow_setBuffersGeometry", b_ANativeWindow_setBuffersGeometry),
             S("eglCreateWindowSurface", b_eglCreateWindowSurface), S("eglCreateContext", b_eglCreateContext), S("eglMakeCurrent", b_eglMakeCurrent),
-            S("glViewport", b_glViewport), S("eglSwapBuffers", b_eglSwapBuffers), S("eglDestroySurface", b_egl_true2), S("eglDestroyContext", b_egl_true2), S("eglTerminate", b_egl_true1),
+            S("glViewport", b_glViewport), S("glScissor", b_glScissor), S("eglSwapBuffers", b_eglSwapBuffers), S("eglDestroySurface", b_egl_true2), S("eglDestroyContext", b_egl_true2), S("eglTerminate", b_egl_true1),
             S("__system_property_get", b_system_property_get), S("__gnu_uldivmod_helper", b_uldivmod_helper),
             S("_Z29ANativeActivity_getInputQueuev", b_na_getInputQueue), S("_Z42ANativeActivity_setFirstLevelHasBeenLoadedb", b_na_void1),
             S("_Z30ANativeActivity_enableWatchdogb", b_na_void1), S("_Z28ANativeActivity_feedWatchdogv", b_na_void0),
@@ -1312,6 +1329,7 @@ jobs:
           static int jhost(const JObj *m, const JArg *a, int na, uint32_t *ret) {
             const char *c = m->a, *n = m->b;
             (void)na;
+            if (!strcmp(n, "setScreenSize")) { L("[scr] UnityPlayer.setScreenSize(%d, %d, %d)\n", (int)a[0].lo, (int)a[1].lo, (int)a[2].lo); *ret = 0; return 1; }
           if (strstr(c, "MotionEvent") || strstr(c, "InputEvent")) {
             int hasi = (m->c[0] == '(' && m->c[1] == 'I'), pi = hasi ? (int)a[0].lo : 0, k;
             if (pi < 0 || pi >= g_mev.n) pi = 0;
