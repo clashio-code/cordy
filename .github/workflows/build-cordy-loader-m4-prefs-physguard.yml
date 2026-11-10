@@ -1623,7 +1623,7 @@ jobs:
           bash -n out/CordyLoader_stage2.sh
           bash -n out/CordyLoader.sh
           bash -n out/CordyLoader_dry.sh
-          DUMPARGS="--dry --dump unity:32ed00:700 --dump unity:32f9a0:180 --dump unity:330084:100 --dump unity:32e8cc:100 --dump unity:32ff94:80 --dump unity:32bf18:100 --dump unity:6a590:30"
+          DUMPARGS="--dry --dump unity:f7440:200 --dump unity:e95a0:60 --dump unity:106d00:80 --dump unity:22ac00:100 --dump unity:22ca00:40"
           sed -e 's/@MODE@/DUMP kode (stage 0)/' -e "s|@ARG@|$DUMPARGS|" src/launcher.tpl > out/CordyLoader_dump.sh
           bash -n out/CordyLoader_dump.sh
 
