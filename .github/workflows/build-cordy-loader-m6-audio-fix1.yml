@@ -1,4 +1,4 @@
-name: build-cordy-loader-m6-audio-fix1
+name: build-cordy-loader-m6-audio-fix2
 on:
   workflow_dispatch:
   push:
@@ -942,7 +942,8 @@ jobs:
           #define JM_MTH 0x4a4d5448u
           #define JM_FLD 0x4a464c44u
           #define JM_STR 0x4a535452u
-          typedef struct { uint32_t magic; char *s; char a[96]; char b[96]; char c[128]; } JObj;
+          #define JM_BYT 0x4a425954u
+          typedef struct { uint32_t magic; char *s; char a[96]; char b[96]; char c[128]; uint32_t n; } JObj;
           typedef struct { char *name; char *sig; void *fn; } JNINM;
           typedef struct { char cls[96]; char name[64]; char sig[96]; void *fn; } Nat;
           static Nat nats[160]; static int nnat;
@@ -1049,15 +1050,352 @@ jobs:
             }
             return r;
           }
+          /* ======================= Java palsu: refleksi Unity + kelas Java buatan game (FileIO, CordyHelper, ...) =======================
+           * Unity 4.5 mencari kelas lewat Class.forName dan ReflectionHelper.getMethodID (+ FromReflectedMethod). Game Cordy membaca isi
+           * (asset bundle) lewat com.silvertree.cordy.FileIO.LoadAsset dan menyimpan data lewat SaveGameData. Di sini semuanya ditiru di C. */
+          typedef struct { uint32_t lo, hi; } JArg;
+          static int g_hostlog;
+          static const JObj *jo(uint32_t v) { return (v && !(v & 3u)) ? (const JObj *)(uintptr_t)v : NULL; }
+          static const char *jstrv(uint32_t v) { const JObj *o = jo(v); return (o && o->magic == JM_STR && o->s) ? o->s : ""; }
+          static JObj *jbytes(const uint8_t *src, size_t n) {
+            JObj *o = jnew(JM_BYT, "[B", "", "");
+            o->s = malloc(n ? n : 1);
+            if (src && n) memcpy(o->s, src, n); else memset(o->s, 0, n ? n : 1);
+            o->n = (uint32_t)n;
+            return o;
+          }
+          /* argumen panggilan Java dibaca dari tanda tangan metode: va_list (vap) atau array jvalue (ja, 8 byte per argumen) */
+          static int jargs(const char *sig, va_list *vap, const uint8_t *ja, JArg *a, int max) {
+            const char *p = sig; int n = 0;
+            if (*p == '(') p++;
+            while (*p && *p != ')' && n < max) {
+              char t = *p; JArg x; x.lo = 0; x.hi = 0;
+              if (t == '[') { while (*p == '[') p++; if (*p == 'L') { while (*p && *p != ';') p++; } if (*p) p++; t = 'L'; }
+              else if (t == 'L') { while (*p && *p != ';') p++; if (*p) p++; }
+              else p++;
+              if (vap) {
+                switch (t) {
+                  case 'J': { long long v = va_arg(*vap, long long); x.lo = (uint32_t)v; x.hi = (uint32_t)((unsigned long long)v >> 32); break; }
+                  case 'D': { double v = va_arg(*vap, double); memcpy(&x, &v, 8); break; }
+                  case 'F': { float v = (float)va_arg(*vap, double); memcpy(&x.lo, &v, 4); break; }
+                  case 'L': x.lo = (uint32_t)(uintptr_t)va_arg(*vap, void *); break;
+                  default: x.lo = (uint32_t)va_arg(*vap, int); break;
+                }
+              } else if (ja) {
+                const uint8_t *q = ja + 8 * n;
+                switch (t) {
+                  case 'Z': case 'B': x.lo = q[0]; break;
+                  case 'C': case 'S': x.lo = (uint32_t)q[0] | ((uint32_t)q[1] << 8); break;
+                  case 'J': case 'D': memcpy(&x, q, 8); break;
+                  default: memcpy(&x.lo, q, 4); break;
+                }
+              }
+              a[n++] = x;
+            }
+            return n;
+          }
+
+          /* ---- inflate kecil (gaya puff, domain publik/zlib) untuk entri APK yang terkompresi (mis. resources.csv) ---- */
+          typedef struct { const uint8_t *in; size_t inlen, incnt; uint8_t *out; size_t outlen, outcnt; long bitbuf; int bitcnt; } PState;
+          typedef struct { short *count; short *symbol; } Huff;
+          static int pbits(PState *s, int need) {
+            long val = s->bitbuf;
+            while (s->bitcnt < need) {
+              if (s->incnt == s->inlen) return -1;
+              val |= (long)(s->in[s->incnt++]) << s->bitcnt;
+              s->bitcnt += 8;
+            }
+            s->bitbuf = val >> need; s->bitcnt -= need;
+            return (int)(val & ((1L << need) - 1));
+          }
+          static int pdecode(PState *s, const Huff *h) {
+            int len, code = 0, first = 0, count, index = 0;
+            for (len = 1; len <= 15; len++) {
+              int b = pbits(s, 1);
+              if (b < 0) return -1;
+              code |= b; count = h->count[len];
+              if (code - count < first) return h->symbol[index + (code - first)];
+              index += count; first += count; first <<= 1; code <<= 1;
+            }
+            return -10;
+          }
+          static int pconstruct(Huff *h, const short *length, int n) {
+            int symbol, len, left; short offs[16];
+            for (len = 0; len <= 15; len++) h->count[len] = 0;
+            for (symbol = 0; symbol < n; symbol++) h->count[length[symbol]]++;
+            if (h->count[0] == n) return 0;
+            left = 1;
+            for (len = 1; len <= 15; len++) { left <<= 1; left -= h->count[len]; if (left < 0) return left; }
+            offs[1] = 0;
+            for (len = 1; len < 15; len++) offs[len + 1] = (short)(offs[len] + h->count[len]);
+            for (symbol = 0; symbol < n; symbol++) if (length[symbol] != 0) h->symbol[offs[length[symbol]]++] = (short)symbol;
+            return left;
+          }
+          static int pcodes(PState *s, const Huff *lc, const Huff *dc) {
+            static const short lens[29] = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 };
+            static const short lext[29] = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 };
+            static const short dists[30] = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 };
+            static const short dext[30] = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
+            int symbol, len, e; unsigned dist;
+            do {
+              symbol = pdecode(s, lc);
+              if (symbol < 0) return symbol;
+              if (symbol < 256) { if (s->outcnt == s->outlen) return 1; s->out[s->outcnt++] = (uint8_t)symbol; }
+              else if (symbol > 256) {
+                symbol -= 257;
+                if (symbol >= 29) return -10;
+                e = pbits(s, lext[symbol]); if (e < 0) return -1;
+                len = lens[symbol] + e;
+                symbol = pdecode(s, dc);
+                if (symbol < 0) return symbol;
+                if (symbol >= 30) return -10;
+                e = pbits(s, dext[symbol]); if (e < 0) return -1;
+                dist = (unsigned)(dists[symbol] + e);
+                if (dist > s->outcnt) return -11;
+                if (s->outcnt + (size_t)len > s->outlen) return 1;
+                while (len--) { s->out[s->outcnt] = s->out[s->outcnt - dist]; s->outcnt++; }
+              }
+            } while (symbol != 256);
+            return 0;
+          }
+          static int pfixed(PState *s) {
+            short lencnt[16], lensym[288], distcnt[16], distsym[30], lengths[288]; Huff lc, dc; int symbol;
+            lc.count = lencnt; lc.symbol = lensym; dc.count = distcnt; dc.symbol = distsym;
+            for (symbol = 0; symbol < 144; symbol++) lengths[symbol] = 8;
+            for (; symbol < 256; symbol++) lengths[symbol] = 9;
+            for (; symbol < 280; symbol++) lengths[symbol] = 7;
+            for (; symbol < 288; symbol++) lengths[symbol] = 8;
+            pconstruct(&lc, lengths, 288);
+            for (symbol = 0; symbol < 30; symbol++) lengths[symbol] = 5;
+            pconstruct(&dc, lengths, 30);
+            return pcodes(s, &lc, &dc);
+          }
+          static int pdynamic(PState *s) {
+            static const short order[19] = { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
+            short lengths[320], lencnt[16], lensym[286], distcnt[16], distsym[30]; Huff lc, dc; int nlen, ndist, ncode, index, err, x;
+            lc.count = lencnt; lc.symbol = lensym; dc.count = distcnt; dc.symbol = distsym;
+            nlen = pbits(s, 5); ndist = pbits(s, 5); ncode = pbits(s, 4);
+            if (nlen < 0 || ndist < 0 || ncode < 0) return -1;
+            nlen += 257; ndist += 1; ncode += 4;
+            if (nlen > 286 || ndist > 30) return -3;
+            for (index = 0; index < ncode; index++) { x = pbits(s, 3); if (x < 0) return -1; lengths[order[index]] = (short)x; }
+            for (; index < 19; index++) lengths[order[index]] = 0;
+            err = pconstruct(&lc, lengths, 19);
+            if (err != 0) return -4;
+            index = 0;
+            while (index < nlen + ndist) {
+              int symbol, len = 0;
+              symbol = pdecode(s, &lc);
+              if (symbol < 0) return symbol;
+              if (symbol < 16) lengths[index++] = (short)symbol;
+              else {
+                if (symbol == 16) { if (index == 0) return -5; len = lengths[index - 1]; x = pbits(s, 2); if (x < 0) return -1; symbol = 3 + x; }
+                else if (symbol == 17) { x = pbits(s, 3); if (x < 0) return -1; symbol = 3 + x; }
+                else { x = pbits(s, 7); if (x < 0) return -1; symbol = 11 + x; }
+                if (index + symbol > nlen + ndist) return -6;
+                while (symbol--) lengths[index++] = (short)len;
+              }
+            }
+            if (lengths[256] == 0) return -9;
+            err = pconstruct(&lc, lengths, nlen);
+            if (err && (err < 0 || nlen != lc.count[0] + lc.count[1])) return -7;
+            err = pconstruct(&dc, lengths + nlen, ndist);
+            if (err && (err < 0 || ndist != dc.count[0] + dc.count[1])) return -8;
+            return pcodes(s, &lc, &dc);
+          }
+          static int pinflate(PState *s) {
+            int last, type, err = 0;
+            s->outcnt = 0; s->bitbuf = 0; s->bitcnt = 0; s->incnt = 0;
+            do {
+              last = pbits(s, 1); type = pbits(s, 2);
+              if (last < 0 || type < 0) return -1;
+              if (type == 0) {
+                unsigned len;
+                s->bitbuf = 0; s->bitcnt = 0;
+                if (s->incnt + 4 > s->inlen) return 2;
+                len = s->in[s->incnt++]; len |= (unsigned)s->in[s->incnt++] << 8;
+                s->incnt += 2;
+                if (s->incnt + len > s->inlen) return 2;
+                if (s->outcnt + len > s->outlen) return 1;
+                while (len--) s->out[s->outcnt++] = s->in[s->incnt++];
+              } else if (type == 1) err = pfixed(s);
+              else if (type == 2) err = pdynamic(s);
+              else err = -1;
+              if (err != 0) break;
+            } while (!last);
+            return err;
+          }
+
+          /* ---- baca satu berkas dari APK (zip): stored atau deflate ---- */
+          static uint32_t rd16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+          static uint32_t rd32(const uint8_t *p) { return rd16(p) | (rd16(p + 2) << 16); }
+          static uint8_t *zip_read(const char *apk, const char *entry, size_t *outn) {
+            FILE *f = fopen(apk, "rb"); uint8_t *tail = NULL, *cd = NULL, *res = NULL, lh[30]; long fsz; size_t tn, i, el = strlen(entry);
+            uint32_t cdoff = 0, cdsz = 0, cnt = 0, k; const uint8_t *p;
+            *outn = 0;
+            if (!f) { L("[zip] gagal membuka %s: %s\n", apk, strerror(errno)); return NULL; }
+            fseek(f, 0, SEEK_END); fsz = ftell(f);
+            tn = fsz < 70000 ? (size_t)fsz : 70000;
+            tail = malloc(tn); fseek(f, fsz - (long)tn, SEEK_SET);
+            if (!tail || fread(tail, 1, tn, f) != tn) { fclose(f); free(tail); return NULL; }
+            for (i = tn >= 22 ? tn - 22 : 0; ; i--) {
+              if (tn >= 22 && rd32(tail + i) == 0x06054b50u) { cnt = rd16(tail + i + 10); cdsz = rd32(tail + i + 12); cdoff = rd32(tail + i + 16); break; }
+              if (i == 0) break;
+            }
+            free(tail);
+            if (!cnt || !cdsz) { fclose(f); L("[zip] direktori pusat tidak ditemukan di %s\n", apk); return NULL; }
+            cd = malloc(cdsz); fseek(f, (long)cdoff, SEEK_SET);
+            if (!cd || fread(cd, 1, cdsz, f) != cdsz) { fclose(f); free(cd); return NULL; }
+            p = cd;
+            for (k = 0; k < cnt && (size_t)(p - cd) + 46 <= cdsz; k++) {
+              uint32_t method = rd16(p + 10), csz = rd32(p + 20), usz = rd32(p + 24), nl = rd16(p + 28), xl = rd16(p + 30), cl = rd16(p + 32), lho = rd32(p + 42);
+              if (rd32(p) != 0x02014b50u) break;
+              if (nl == el && !memcmp(p + 46, entry, el)) {
+                uint8_t *comp; uint32_t dataoff;
+                fseek(f, (long)lho, SEEK_SET);
+                if (fread(lh, 1, 30, f) != 30 || rd32(lh) != 0x04034b50u) break;
+                dataoff = lho + 30 + rd16(lh + 26) + rd16(lh + 28);
+                comp = malloc(csz ? csz : 1); fseek(f, (long)dataoff, SEEK_SET);
+                if (!comp || fread(comp, 1, csz, f) != csz) { free(comp); break; }
+                if (method == 0) { res = comp; *outn = csz; }
+                else if (method == 8) {
+                  PState s; uint8_t *o = malloc(usz ? usz : 1); int r;
+                  memset(&s, 0, sizeof s); s.in = comp; s.inlen = csz; s.out = o; s.outlen = usz;
+                  r = o ? pinflate(&s) : -99;
+                  if (r == 0 && s.outcnt == usz) { res = o; *outn = usz; } else { L("[zip] inflate gagal (%d) untuk %s\n", r, entry); free(o); }
+                  free(comp);
+                } else { L("[zip] metode kompresi %u tidak didukung (%s)\n", method, entry); free(comp); }
+                break;
+              }
+              p += 46 + nl + xl + cl;
+            }
+            free(cd); fclose(f);
+            return res;
+          }
+
+          static uint8_t *file_read_all(const char *path, size_t *outn) {
+            FILE *f = fopen(path, "rb"); long n; uint8_t *b;
+            *outn = 0;
+            if (!f) return NULL;
+            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            if (n < 0) { fclose(f); return NULL; }
+            b = malloc(n ? (size_t)n : 1);
+            if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
+            fclose(f); *outn = (size_t)n;
+            return b;
+          }
+          static int gamedata_path(const char *name, char *out, size_t n) {
+            if (!name[0] || strchr(name, '/') || strstr(name, "..")) return -1;
+            snprintf(out, n, "%s/files/%s", g_cwd, name);
+            return 0;
+          }
+
+          /* metode Java yang ditiru. Mengembalikan 1 bila ditangani; *ret = nilai balik 32-bit (float sebagai pola bit) */
+          static int jhost(const JObj *m, const JArg *a, int na, uint32_t *ret) {
+            const char *c = m->a, *n = m->b;
+            (void)na;
+            if (!strcmp(c, "java/lang/Class")) {
+              if (!strcmp(n, "forName")) {
+                char t[128]; size_t i;
+                snprintf(t, sizeof t, "%s", jstrv(a[0].lo));
+                for (i = 0; t[i]; i++) if (t[i] == '.') t[i] = '/';
+                *ret = U32(jclsobj(t)); return 1;
+              }
+              return 0;
+            }
+            if (!strcmp(c, "com/unity3d/player/ReflectionHelper")) {
+              const JObj *k = jo(a[0].lo);
+              const char *kn = (k && (k->magic == JM_CLS || k->magic == JM_STR) && k->a[0]) ? k->a : "java/lang/Object";
+              if (!strcmp(n, "getMethodID")) { *ret = U32(jnew(JM_MTH, kn, jstrv(a[1].lo), jstrv(a[2].lo))); return 1; }
+              if (!strcmp(n, "getFieldID")) { *ret = U32(jnew(JM_FLD, kn, jstrv(a[1].lo), jstrv(a[2].lo))); return 1; }
+              if (!strcmp(n, "getConstructorID")) { *ret = U32(jnew(JM_MTH, kn, "<init>", jstrv(a[1].lo))); return 1; }
+              return 0;
+            }
+            if (!strcmp(c, "com/silvertree/cordy/FileIO") || !strcmp(c, "com/silvertree/cordy/fileio/FileIOImp")) {
+              char path[600]; size_t len = 0; uint8_t *data;
+              if (!strcmp(n, "LoadAsset")) {
+                snprintf(path, sizeof path, "assets/cordy_asset_data/%s", jstrv(a[0].lo));
+                data = zip_read(g_apkabs, path, &len);
+                L("[host] FileIO.LoadAsset(\"%s\", %u) -> %s (%u byte)\n", jstrv(a[0].lo), (unsigned)a[1].lo, data ? "ADA" : "TIDAK ADA", (unsigned)len);
+                *ret = data ? U32(jbytes(data, len)) : 0u; free(data); return 1;
+              }
+              if (!strcmp(n, "DoesGameDataExist")) {
+                struct stat st; *ret = (gamedata_path(jstrv(a[0].lo), path, sizeof path) == 0 && stat(path, &st) == 0) ? 1u : 0u;
+                L("[host] FileIO.DoesGameDataExist(\"%s\") -> %u\n", jstrv(a[0].lo), (unsigned)*ret); return 1;
+              }
+              if (!strcmp(n, "LoadGameData")) {
+                data = (gamedata_path(jstrv(a[0].lo), path, sizeof path) == 0) ? file_read_all(path, &len) : NULL;
+                L("[host] FileIO.LoadGameData(\"%s\") -> %s (%u byte)\n", jstrv(a[0].lo), data ? "ADA" : "TIDAK ADA", (unsigned)len);
+                *ret = data ? U32(jbytes(data, len)) : 0u; free(data); return 1;
+              }
+              if (!strcmp(n, "SaveGameData")) {
+                const JObj *b = jo(a[1].lo); *ret = 0;
+                if (b && b->magic == JM_BYT && gamedata_path(jstrv(a[0].lo), path, sizeof path) == 0) {
+                  char tmp[640]; FILE *fp; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+                  fp = fopen(tmp, "wb");
+                  if (fp) { fwrite(b->s, 1, b->n, fp); fflush(fp); fsync(fileno(fp)); fclose(fp); rename(tmp, path); }
+                  L("[host] FileIO.SaveGameData(\"%s\", %u byte) -> %s\n", jstrv(a[0].lo), (unsigned)b->n, fp ? "OK" : "GAGAL");
+                } else L("[host] FileIO.SaveGameData(\"%s\") argumen tidak valid\n", jstrv(a[0].lo));
+                return 1;
+              }
+              if (!strcmp(n, "DoesLiteGameDataExist") || !strcmp(n, "LoadLiteGameData") || !strcmp(n, "Test") || !strcmp(n, "Test2")) { *ret = 0; return 1; }
+              return 0;
+            }
+            if (!strcmp(c, "com/silvertree/cordy/CordyHelper")) {
+              if (!strcmp(n, "getDPI")) { *ret = f2u(160.0f); return 1; }
+              if (!strcmp(n, "getPackagePath")) { *ret = U32(jstr(g_apkabs)); return 1; }
+              if (!strcmp(n, "getCPUHz")) { *ret = U32(jstr("1200000")); return 1; }
+              if (!strcmp(n, "getGLRendererName")) { *ret = U32(jstr("Mali-G31")); return 1; }
+              if (!strcmp(n, "getGLVendor")) { *ret = U32(jstr("ARM")); return 1; }
+              if (!strcmp(n, "getGLVersion")) { *ret = U32(jstr("OpenGL ES 2.0")); return 1; }
+              if (!strcmp(n, "IsBadMultitouch") || !strcmp(n, "doesKeyBoardExist") || !strcmp(n, "isSlideOpen") || !strcmp(n, "isTablet")) { *ret = 0; return 1; }
+              return 0;
+            }
+            if (!strcmp(c, "com/silvertree/cordy/ScreenEvent") && !strcmp(n, "IsPhoneUnlocked")) { *ret = 1; return 1; }
+            if (!strcmp(c, "com/silvertree/cordy/AnalyticsWrapper") || !strcmp(c, "com/silvertree/cordy/Billing")) {
+              if (!strcmp(n, "PopMessage")) { *ret = U32(jstr("")); return 1; }
+              if (!strcmp(n, "Inst")) return 0;
+              *ret = 0; return 1;
+            }
+            return 0;
+          }
+          static int jdispatch(const JObj *m, va_list *vap, const uint8_t *ja, uint32_t *r) {
+            JArg a[8]; int n, h;
+            if (!m || m->magic != JM_MTH) return 0;
+            memset(a, 0, sizeof a);
+            n = jargs(m->c, vap, ja, a, 8);
+            h = jhost(m, a, n, r);
+            if (h && g_hostlog++ < 200) L("[host] %s.%s%s -> 0x%x\n", m->a, m->b, m->c, (unsigned)*r);
+            return h;
+          }
+          /* fungsi JNI array byte */
+          static int j_GetArrayLength(void *e, const JObj *o) { (void)e; return (o && o->magic == JM_BYT) ? (int)o->n : 0; }
+          static void *j_NewByteArray(void *e, int n) { (void)e; return jbytes(NULL, n < 0 ? 0 : (size_t)n); }
+          static void *j_GetByteArrayElements(void *e, const JObj *o, uint8_t *copy) { (void)e; if (copy) *copy = 0; return (o && o->magic == JM_BYT) ? (void *)o->s : NULL; }
+          static void j_ReleaseByteArrayElements(void *e, const JObj *o, void *p, int mode) { (void)e; (void)o; (void)p; (void)mode; }
+          static void j_GetByteArrayRegion(void *e, const JObj *o, int st, int len, void *buf) {
+            (void)e;
+            if (o && o->magic == JM_BYT && st >= 0 && len >= 0 && (uint32_t)st + (uint32_t)len <= o->n) memcpy(buf, o->s + st, (size_t)len);
+          }
+          static void j_SetByteArrayRegion(void *e, const JObj *o, int st, int len, const void *buf) {
+            (void)e;
+            if (o && o->magic == JM_BYT && st >= 0 && len >= 0 && (uint32_t)st + (uint32_t)len <= o->n) memcpy(o->s + st, buf, (size_t)len);
+          }
+          static void *j_Reflected(void *e, void *x) { (void)e; return x; }
+          static void *j_ToReflected(void *e, void *cls, void *mid, int st) { (void)e; (void)cls; (void)st; return mid; }
+
+
           static int is_pp(const JObj *m) { return m && m->magic == JM_MTH && strstr(m->a, "PlayerPrefs") && strcmp(m->b, "<init>") != 0; }
           static uint32_t jcall_v(int slot, void *mid, va_list ap) {
             const JObj *m = (const JObj *)mid;
             if (is_pp(m)) { va_list cp; uint32_t r; va_copy(cp, ap); r = jcall_pp(m, &cp, NULL); va_end(cp); return r; }
+            { va_list cp; uint32_t r = 0; int h; va_copy(cp, ap); h = jdispatch(m, &cp, NULL, &r); va_end(cp); if (h) return r; }
             return jcall(slot, mid);
           }
           static uint32_t jcall_a(int slot, void *mid, const void *a) {
             const JObj *m = (const JObj *)mid;
             if (is_pp(m)) return jcall_pp(m, NULL, (const uint8_t *)a);
+            { uint32_t r = 0; if (jdispatch(m, NULL, (const uint8_t *)a, &r)) return r; }
             return jcall(slot, mid);
           }
           static uint32_t jcall(int slot, void *mid) {
@@ -1170,11 +1508,18 @@ jobs:
             g_jni[31] = (void *)j_GetObjectClass; g_jni[33] = (void *)j_GetMethodID; g_jni[94] = (void *)j_GetFieldID;
             g_jni[113] = (void *)j_GetMethodID; g_jni[144] = (void *)j_GetFieldID; g_jni[167] = (void *)j_NewStringUTF;
             g_jni[168] = (void *)j_GetStringUTFLength; g_jni[169] = (void *)j_GetStringUTFChars; g_jni[170] = (void *)j_Void;
-            g_jni[171] = (void *)j_Null; g_jni[215] = (void *)j_RegisterNatives; g_jni[219] = (void *)j_GetJavaVM; g_jni[228] = (void *)j_Null;
+            g_jni[171] = (void *)j_GetArrayLength; g_jni[215] = (void *)j_RegisterNatives; g_jni[219] = (void *)j_GetJavaVM; g_jni[228] = (void *)j_Null;
             g_vm_tab[3] = (void *)vm_ok; g_vm_tab[4] = (void *)vm_Attach; g_vm_tab[5] = (void *)vm_ok; g_vm_tab[6] = (void *)vm_GetEnv; g_vm_tab[7] = (void *)vm_Attach;
             for (i = 0; i < 233; i++) {
               if (!strcmp(jni_names[i], "GetStaticIntField")) g_jni[i] = (void *)j_GetStaticInt;
               else if (!strcmp(jni_names[i], "GetStaticObjectField")) g_jni[i] = (void *)j_GetStaticObj;
+              else if (!strcmp(jni_names[i], "FromReflectedMethod") || !strcmp(jni_names[i], "FromReflectedField")) g_jni[i] = (void *)j_Reflected;
+              else if (!strcmp(jni_names[i], "ToReflectedMethod") || !strcmp(jni_names[i], "ToReflectedField")) g_jni[i] = (void *)j_ToReflected;
+              else if (!strcmp(jni_names[i], "NewByteArray")) g_jni[i] = (void *)j_NewByteArray;
+              else if (!strcmp(jni_names[i], "GetByteArrayElements") || !strcmp(jni_names[i], "GetPrimitiveArrayCritical")) g_jni[i] = (void *)j_GetByteArrayElements;
+              else if (!strcmp(jni_names[i], "ReleaseByteArrayElements") || !strcmp(jni_names[i], "ReleasePrimitiveArrayCritical")) g_jni[i] = (void *)j_ReleaseByteArrayElements;
+              else if (!strcmp(jni_names[i], "GetByteArrayRegion")) g_jni[i] = (void *)j_GetByteArrayRegion;
+              else if (!strcmp(jni_names[i], "SetByteArrayRegion")) g_jni[i] = (void *)j_SetByteArrayRegion;
             }
             (void)g_unity_cls;
           }
