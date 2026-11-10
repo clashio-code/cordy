@@ -1,0 +1,1547 @@
+name: build-armhf-cordy-m2
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang toolchain ARM 32-bit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - name: Tulis sumber
+        run: |
+          mkdir -p src out/cordy_android/libs
+          cat > src/cordyloader.c <<'EOF_C2'
+          /* cordyloader - Milestone 2 port Cordy (Unity 3.5.4f1, Android armeabi-v7a) ke armhf / muOS.
+           * Memuat libmono.so + libunity.so (ELF32 ARM, bionic) SENDIRI tanpa dlopen, memetakan impor ke shim bionic->glibc,
+           * menyediakan JNI palsu, menjalankan konstruktor + JNI_OnLoad, lalu MENCATAT tabel RegisterNatives milik UnityPlayer.
+           * Dasar kode: luxorloader (sudah terbukti jalan di RG40XXV).
+           * Pakai: cordyloader <folder-libs> [--dry] [--apk cordy.apk] [--stage N] [--timeout detik]
+           *   stage 2 (default) = konstruktor + JNI_OnLoad ; stage 3 = + nativeFile(apk) jika signature cocok. */
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <setjmp.h>
+          #include <math.h>
+          #include <time.h>
+          #include <errno.h>
+          #include <elf.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <signal.h>
+          #include <ucontext.h>
+          #include <pthread.h>
+          #include <semaphore.h>
+          #include <dirent.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <sys/utsname.h>
+          #include <gnu/libc-version.h>
+
+          #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+          #define PAGE 4096u
+          #define MAXMOD 4
+          #define MAXUNRES 64
+          #define U32(p) ((uint32_t)(uintptr_t)(p))
+          /* Library Android armeabi-v7a memakai ABI softfp (float/double lewat r0-r3), sedangkan proses ini hard-float.
+           * Semua fungsi FP yang dipanggil game ATAU yang dipanggil-balik ke game harus memakai "aapcs" dasar. */
+          #ifdef __arm__
+          #define AAPCS __attribute__((pcs("aapcs")))
+          #else
+          #define AAPCS
+          #endif
+
+          static FILE *g_log;
+
+          static void L(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap); fflush(stdout);
+            if (g_log) { va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap); fflush(g_log); }
+          }
+
+          /* ======================= modul ELF ======================= */
+          typedef struct {
+            char name[64];
+            uint8_t *file; size_t fsize;
+            uint8_t *base; size_t span; uintptr_t bias;
+            Elf32_Sym *sym; int nsym; const char *str;
+            Elf32_Rel *rel; uint32_t nrel; Elf32_Rel *jrel; uint32_t njrel;
+            uint32_t init; uint32_t *iarr; uint32_t niarr;
+          } Mod;
+
+          static Mod mods[MAXMOD];
+          static int nmods;
+
+          static const char *unres_name[MAXUNRES];
+          static int nunres;
+          static const char *shim_hit[256];
+          static int nshim_hit;
+          static int cnt_self, cnt_mod, cnt_shim, cnt_libc, cnt_gl, cnt_unres, cnt_weak0;
+          static void *h_gles, *h_egl;
+
+          static int trap_unres(int i);
+          static int jni_trap(int i);
+          #include "stubs.inc"
+
+          static int trap_unres(int i) {
+            L("\n*** PANGGILAN KE SIMBOL TAK TERSELESAIKAN: %s ***\n", (i >= 0 && i < nunres) ? unres_name[i] : "?");
+            _exit(3);
+            return 0;
+          }
+
+          /* nama fungsi (dynsym) terdekat di modul game untuk alamat a */
+          static const char *game_sym(const Mod *m, uintptr_t a, uint32_t *delta) {
+            uint32_t off = (uint32_t)(a - m->bias), best = 0; const char *nm = NULL; int i;
+            for (i = 1; i < m->nsym; i++) {
+              const Elf32_Sym *y = &m->sym[i];
+              if (y->st_shndx == SHN_UNDEF || !y->st_name || ELF32_ST_TYPE(y->st_info) != STT_FUNC) continue;
+              if ((y->st_value & ~1u) <= off && (y->st_value & ~1u) >= best) { best = y->st_value & ~1u; nm = m->str + y->st_name; }
+            }
+            *delta = off - best;
+            return nm;
+          }
+          static void describe(uintptr_t a) {
+            int i;
+            for (i = 0; i < nmods; i++)
+              if (a >= (uintptr_t)mods[i].base && a < (uintptr_t)mods[i].base + mods[i].span) {
+                uint32_t d = 0; const char *nm = game_sym(&mods[i], a, &d);
+                L("    -> %s + 0x%x  [%s+0x%x]\n", mods[i].name, (unsigned)(a - mods[i].bias), nm ? nm : "?", (unsigned)d);
+              }
+          }
+
+          /* jejak pemanggil di kode game: pindai stack, ambil nilai yang jatuh di modul game DAN didahului instruksi panggilan (bl / mov lr,pc) */
+          static void print_game_trace(const char *why) {
+          #if defined(__arm__)
+            const uintptr_t *sp = (const uintptr_t *)__builtin_frame_address(0);
+            int k, shown = 0;
+            L("  [trace] %s (return address game di stack, terdekat dulu):\n", why);
+            for (k = 0; k < 4096 && shown < 40; k++) {
+              uintptr_t v = sp[k]; int i;
+              for (i = 0; i < nmods; i++) {
+                if (v >= (uintptr_t)mods[i].base + 8 && v < (uintptr_t)mods[i].base + mods[i].span && (v & 3u) == 0) {
+                  uint32_t p1 = *(const uint32_t *)(v - 4), p2 = *(const uint32_t *)(v - 8);
+                  int call = ((p1 >> 24) == 0xebu) || ((p1 & 0xfffffff0u) == 0xe12fff30u) || (p2 == 0xe1a0e00fu);
+                  if (call) {
+                    uint32_t d = 0; const char *nm = game_sym(&mods[i], v, &d);
+                    L("    #%d sp+%d: %s + 0x%x  [%s+0x%x]\n", shown, k * 4, mods[i].name, (unsigned)(v - mods[i].bias), nm ? nm : "?", (unsigned)d);
+                    shown++;
+                  }
+                  break;
+                }
+              }
+            }
+          #else
+            (void)why;
+          #endif
+          }
+
+          /* cetak baris /proc/self/maps yang memuat alamat a (nama library sistem tempat crash) */
+          static void map_of(const char *tag, uintptr_t a) {
+            FILE *m = fopen("/proc/self/maps", "r");
+            char ln[512];
+            if (!m) return;
+            while (fgets(ln, sizeof ln, m)) {
+              unsigned long lo, hi;
+              const char *q = ln; lo = 0; hi = 0;
+              /* parse hex manual: sscanf/strtoul di glibc build >=2.38 terikat ke simbol GLIBC_2.38, device cuma 2.37 */
+              while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) lo = lo * 16 + (unsigned long)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+              if (*q == '-') q++;
+              while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) hi = hi * 16 + (unsigned long)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+              if (hi && a >= lo && a < hi) {
+                char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
+                L("    %s in map: %s  (offset di map = 0x%lx)\n", tag, ln, (unsigned long)(a - lo));
+                break;
+              }
+            }
+            fclose(m);
+          }
+          #if defined(__arm__)
+          /* Breakpoint perangkat lunak: ganti "cmp r0,#0" (setelah panggilan) dengan UDF, tangani SIGILL, catat r0, emulasikan flag. */
+          typedef struct { uintptr_t addr; uint32_t orig; const char *tag; } Bp;
+          static Bp g_bp[16]; static int g_nbp, g_bp_hits;
+          static void bp_add(uintptr_t a, const char *tag) {
+            uintptr_t pg = a & ~(uintptr_t)(PAGE - 1);
+            if (g_nbp >= 16 || *(uint32_t *)a != 0xe3500000u) { L("[bp] lewati %s (instruksi bukan cmp r0,#0)\n", tag); return; }
+            if (mprotect((void *)pg, 2 * PAGE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+            g_bp[g_nbp].addr = a; g_bp[g_nbp].orig = *(uint32_t *)a; g_bp[g_nbp].tag = tag;
+            *(uint32_t *)a = 0xe7f000f0u;
+            __builtin___clear_cache((char *)a, (char *)a + 4);
+            mprotect((void *)pg, 2 * PAGE, PROT_READ | PROT_EXEC);
+            g_nbp++;
+          }
+          static int bp_handle(ucontext_t *uc) {
+            uintptr_t pc = uc->uc_mcontext.arm_pc; int i;
+            for (i = 0; i < g_nbp; i++) if (g_bp[i].addr == pc) {
+              int32_t r0 = (int32_t)uc->uc_mcontext.arm_r0;
+              unsigned long cp = uc->uc_mcontext.arm_cpsr & 0x0fffffffUL;
+              if (r0 < 0) cp |= 1UL << 31;
+              if (r0 == 0) cp |= 1UL << 30;
+              cp |= 1UL << 29;
+              uc->uc_mcontext.arm_cpsr = cp;
+              uc->uc_mcontext.arm_pc = pc + 4;
+              if (g_bp_hits++ < 300) L("[bp] %s: r0=%d (0x%x)\n", g_bp[i].tag, (int)r0, (unsigned)r0);
+              return 1;
+            }
+            return 0;
+          }
+          #endif
+          static void on_sig(int sig, siginfo_t *si, void *ctx) {
+            ucontext_t *uc = (ucontext_t *)ctx;
+            uintptr_t pc = 0, lr = 0;
+          #if defined(__arm__)
+            pc = uc->uc_mcontext.arm_pc; lr = uc->uc_mcontext.arm_lr;
+          #elif defined(__x86_64__)
+            pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+          #endif
+          #if defined(__arm__)
+            if (sig == SIGILL && bp_handle(uc)) return;
+          #endif
+            L("\n*** SINYAL %d  addr=%p  pc=%p  lr=%p ***\n", sig, si->si_addr, (void *)pc, (void *)lr);
+            describe(pc); describe(lr);
+            map_of("pc", pc); map_of("lr", lr);
+            { FILE *m = fopen("/proc/self/maps", "r"); char ln[512]; int cnt = 0;
+              if (m) { L("  [peta r-x]\n"); while (fgets(ln, sizeof ln, m) && cnt < 60) if (strstr(ln, "r-xp") || strstr(ln, "rwxp")) { L("    %s", ln); cnt++; } fclose(m); } }
+          #if defined(__arm__)
+            L("    r0=%08lx r1=%08lx r2=%08lx r3=%08lx r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
+              uc->uc_mcontext.arm_r0, uc->uc_mcontext.arm_r1, uc->uc_mcontext.arm_r2, uc->uc_mcontext.arm_r3,
+              uc->uc_mcontext.arm_r4, uc->uc_mcontext.arm_r5, uc->uc_mcontext.arm_r6, uc->uc_mcontext.arm_r7);
+            L("    r8=%08lx r9=%08lx r10=%08lx fp=%08lx ip=%08lx sp=%08lx\n",
+              uc->uc_mcontext.arm_r8, uc->uc_mcontext.arm_r9, uc->uc_mcontext.arm_r10, uc->uc_mcontext.arm_fp,
+              uc->uc_mcontext.arm_ip, uc->uc_mcontext.arm_sp);
+            {
+              Dl_info di; int k;
+              if (dladdr((void *)pc, &di)) L("  [dladdr pc] %s : %s (+0x%x)\n", di.dli_fname ? di.dli_fname : "?", di.dli_sname ? di.dli_sname : "(tak ada simbol ekspor)", di.dli_saddr ? (unsigned)(pc - (uintptr_t)di.dli_saddr) : 0u);
+              if (dladdr((void *)lr, &di)) L("  [dladdr lr] %s : %s (+0x%x)\n", di.dli_fname ? di.dli_fname : "?", di.dli_sname ? di.dli_sname : "(tak ada simbol ekspor)", di.dli_saddr ? (unsigned)(lr - (uintptr_t)di.dli_saddr) : 0u);
+              /* dump byte kode di sekitar pc supaya bisa didisassemble offline (ARM/Thumb) */
+              {
+                const uint8_t *c = (const uint8_t *)((pc & ~1u) - 96);
+                L("  [code] 96 byte sebelum + 32 byte sesudah pc (mulai %p):", (const void *)c);
+                for (k = 0; k < 128; k++) { if (k % 32 == 0) L("\n   "); L("%02x", c[k]); }
+                L("\n");
+              }
+              /* stack mentah 40 kata pertama */
+              {
+                const uintptr_t *sp = (const uintptr_t *)uc->uc_mcontext.arm_sp;
+                L("  [stack mentah]");
+                for (k = 0; k < 40; k++) { if (k % 4 == 0) L("\n   sp+%03d:", k * 4); L(" %08x", (unsigned)sp[k]); }
+                L("\n");
+              }
+            }
+            {
+              /* backtrace kasar: pindai 2048 byte stack, tampilkan nilai yang jatuh di dalam libmain/libfmodex */
+              const uintptr_t *sp = (const uintptr_t *)uc->uc_mcontext.arm_sp;
+              int k, shown = 0;
+              L("  [stack] kandidat return address di game (bisa sisa lama):\n");
+              for (k = 0; k < 512 && shown < 16; k++) {
+                int i;
+                for (i = 0; i < nmods; i++)
+                  if (sp[k] >= (uintptr_t)mods[i].base && sp[k] < (uintptr_t)mods[i].base + mods[i].span) {
+                    uint32_t d = 0; const char *nm = game_sym(&mods[i], sp[k], &d);
+                    L("    sp+%d: %s + 0x%x  [%s+0x%x]\n", k * 4, mods[i].name, (unsigned)(sp[k] - mods[i].bias), nm ? nm : "?", (unsigned)d); shown++; break;
+                  }
+              }
+            }
+          #endif
+            _exit(128 + sig);
+          }
+
+          /* ======================= shim bionic -> glibc ======================= */
+          /* --- ctype / stdio bionic --- */
+          static char bionic_ctype[1 + 256];
+          static int16_t bionic_tolower[1 + 256], bionic_toupper[1 + 256];
+          /* bionic: _tolower_tab_/_toupper_tab_ adalah VARIABEL POINTER (const short *), bukan array. Kode game: ldr r1,[sym]; ldrsh [r1+2c+2]. */
+          static const int16_t *p_tolower = bionic_tolower, *p_toupper = bionic_toupper;
+          /* _ctype_ lama bionic juga POINTER (const char *): kode game: ldr r2,[sym]; ldrb [r2+c+1] (terlihat di gvFile::_validName) */
+          static const char *p_ctype = bionic_ctype;
+          static char bionic_sF[3 * 84];
+
+          static void init_tables(void) {
+            int c;
+            bionic_ctype[0] = 0; bionic_tolower[0] = -1; bionic_toupper[0] = -1;
+            for (c = 0; c < 256; c++) {
+              unsigned f = 0;
+              if (c < 128) {
+                if (c >= 'A' && c <= 'Z') f |= 0x01;
+                if (c >= 'a' && c <= 'z') f |= 0x02;
+                if (c >= '0' && c <= '9') f |= 0x04;
+                if (c == ' ' || (c >= 9 && c <= 13)) f |= 0x08;
+                if ((c > 32 && c < 127) && !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) f |= 0x10;
+                if (c < 32 || c == 127) f |= 0x20;
+                if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) f |= 0x40;
+                if (c == ' ') f |= 0x80;
+              }
+              bionic_ctype[1 + c] = (char)f;
+              bionic_tolower[1 + c] = (int16_t)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+              bionic_toupper[1 + c] = (int16_t)((c >= 'a' && c <= 'z') ? c - 32 : c);
+            }
+          }
+
+          static FILE *xf(FILE *f) {
+            uintptr_t a = (uintptr_t)f, b = (uintptr_t)bionic_sF;
+            if (a >= b && a < b + sizeof bionic_sF) { unsigned i = (unsigned)((a - b) / 84); return i == 0 ? stdin : i == 1 ? stdout : stderr; }
+            return f;
+          }
+          static int b_fprintf(FILE *f, const char *fmt, ...) { va_list ap; int r; va_start(ap, fmt); r = vfprintf(xf(f), fmt, ap); va_end(ap); return r; }
+          static int b_vfprintf(FILE *f, const char *fmt, va_list ap) { return vfprintf(xf(f), fmt, ap); }
+          static int b_fputs(const char *s, FILE *f) { return fputs(s, xf(f)); }
+          static int b_fputc(int c, FILE *f) { return fputc(c, xf(f)); }
+          static size_t b_fwrite(const void *p, size_t s, size_t n, FILE *f) { return fwrite(p, s, n, xf(f)); }
+          static size_t b_fread(void *p, size_t s, size_t n, FILE *f) { return fread(p, s, n, xf(f)); }
+          static int b_fflush(FILE *f) { return fflush(xf(f)); }
+          static char *b_fgets(char *s, int n, FILE *f) { return fgets(s, n, xf(f)); }
+          static int b_fgetc(FILE *f) { return fgetc(xf(f)); }
+          static int b_srget(FILE *f) { return fgetc(xf(f)); }
+          static int b_swbuf(int c, FILE *f) { return fputc(c, xf(f)); }
+
+          /* --- log / assert / misc bionic --- */
+          static int *b_errno(void) { return &errno; }
+          static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
+            char buf[1024]; va_list ap;
+            va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap); va_end(ap);
+            L("[droid %d/%s] %s\n", prio, tag ? tag : "?", buf);
+            return 1;
+          }
+          static int b_android_log_write(int prio, const char *tag, const char *text) {
+            L("[droid %d/%s] %s\n", prio, tag ? tag : "?", text ? text : "");
+            return 1;
+          }
+          static void b_assert2(const char *file, int line, const char *func, const char *msg) {
+            L("\n*** ASSERT bionic: %s:%d (%s): %s ***\n", file, line, func, msg);
+            abort();
+          }
+          static int b_aeabi_atexit(void *obj, void (*dtor)(void *), void *dso) {
+            extern int __cxa_atexit(void (*)(void *), void *, void *);
+            return __cxa_atexit(dtor, obj, dso);
+          }
+          static void *b_register_frame_info(const void *a, void *b) { (void)a; (void)b; return NULL; }
+          static void *b_deregister_frame_info(const void *a) { (void)a; return NULL; }
+          static void b_jv_register(void *a) { (void)a; }
+          static uint32_t b_stack_chk_guard = 0x00a4c3e1u;
+
+          /* --- stat (layout stat bionic ARM32 = stat64 kernel) --- */
+          static int b_stat(const char *p, void *b) { return stat64(p, (struct stat64 *)b); }
+          static int b_fstat(int fd, void *b) { return fstat64(fd, (struct stat64 *)b); }
+          static int b_lstat(const char *p, void *b) { return lstat64(p, (struct stat64 *)b); }
+
+          /* --- pthread: objek bionic cuma 4 byte -> simpan pointer ke objek glibc asli (lazy) --- */
+          static pthread_mutex_t g_initlock = PTHREAD_MUTEX_INITIALIZER;
+
+          static pthread_mutex_t *mx_get(uint32_t *slot) {
+            uint32_t v = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+            if (v > 0xFFFFu) return (pthread_mutex_t *)(uintptr_t)v;
+            pthread_mutex_lock(&g_initlock);
+            v = *slot;
+            if (v <= 0xFFFFu) {
+              pthread_mutex_t *m = calloc(1, sizeof *m);
+              pthread_mutexattr_t a;
+              pthread_mutexattr_init(&a);
+              if (v & 0x4000) pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+              else if (v & 0x8000) pthread_mutexattr_settype(&a, PTHREAD_MUTEX_ERRORCHECK);
+              pthread_mutex_init(m, &a); pthread_mutexattr_destroy(&a);
+              v = U32(m);
+              __atomic_store_n(slot, v, __ATOMIC_RELEASE);
+            }
+            pthread_mutex_unlock(&g_initlock);
+            return (pthread_mutex_t *)(uintptr_t)v;
+          }
+          static int b_mutex_init(uint32_t *slot, const long *attr) {
+            pthread_mutex_t *m = calloc(1, sizeof *m);
+            pthread_mutexattr_t a;
+            pthread_mutexattr_init(&a);
+            if (attr && *attr == 1) pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+            else if (attr && *attr == 2) pthread_mutexattr_settype(&a, PTHREAD_MUTEX_ERRORCHECK);
+            pthread_mutex_init(m, &a); pthread_mutexattr_destroy(&a);
+            *slot = U32(m);
+            return 0;
+          }
+          static int b_mutex_destroy(uint32_t *slot) {
+            if (*slot > 0xFFFFu) { pthread_mutex_t *m = (pthread_mutex_t *)(uintptr_t)*slot; pthread_mutex_destroy(m); free(m); }
+            *slot = 0;
+            return 0;
+          }
+          static int b_mutex_lock(uint32_t *s) { return pthread_mutex_lock(mx_get(s)); }
+          static int b_mutex_unlock(uint32_t *s) { return pthread_mutex_unlock(mx_get(s)); }
+          static int b_mutex_trylock(uint32_t *s) { return pthread_mutex_trylock(mx_get(s)); }
+          static int b_mutexattr_init(long *a) { *a = 0; return 0; }
+          static int b_mutexattr_settype(long *a, int t) { *a = t; return 0; }
+          static int b_mutexattr_gettype(const long *a, int *t) { *t = (int)*a; return 0; }
+          static int b_mutexattr_destroy(long *a) { (void)a; return 0; }
+
+          static pthread_cond_t *cv_get(uint32_t *slot) {
+            uint32_t v = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+            if (v > 0xFFFFu) return (pthread_cond_t *)(uintptr_t)v;
+            pthread_mutex_lock(&g_initlock);
+            v = *slot;
+            if (v <= 0xFFFFu) {
+              pthread_cond_t *c = calloc(1, sizeof *c);
+              pthread_cond_init(c, NULL);
+              v = U32(c);
+              __atomic_store_n(slot, v, __ATOMIC_RELEASE);
+            }
+            pthread_mutex_unlock(&g_initlock);
+            return (pthread_cond_t *)(uintptr_t)v;
+          }
+          static int b_cond_init(uint32_t *slot, const void *attr) { pthread_cond_t *c = calloc(1, sizeof *c); (void)attr; pthread_cond_init(c, NULL); *slot = U32(c); return 0; }
+          static int b_cond_destroy(uint32_t *slot) { if (*slot > 0xFFFFu) { pthread_cond_t *c = (pthread_cond_t *)(uintptr_t)*slot; pthread_cond_destroy(c); free(c); } *slot = 0; return 0; }
+          static int b_cond_wait(uint32_t *c, uint32_t *m) { return pthread_cond_wait(cv_get(c), mx_get(m)); }
+          static int b_cond_timedwait(uint32_t *c, uint32_t *m, const struct timespec *t) { return pthread_cond_timedwait(cv_get(c), mx_get(m), t); }
+          static int b_cond_signal(uint32_t *c) { return pthread_cond_signal(cv_get(c)); }
+          static int b_cond_broadcast(uint32_t *c) { return pthread_cond_broadcast(cv_get(c)); }
+          static int b_condattr_init(long *a) { *a = 0; return 0; }
+          static int b_condattr_destroy(long *a) { (void)a; return 0; }
+
+          static int b_sem_init(uint32_t *slot, int pshared, unsigned v) { sem_t *s = calloc(1, sizeof *s); sem_init(s, pshared, v); *slot = U32(s); return 0; }
+          static int b_sem_destroy(uint32_t *slot) { sem_t *s = (sem_t *)(uintptr_t)*slot; if (s) { sem_destroy(s); free(s); } *slot = 0; return 0; }
+          static int b_sem_wait(uint32_t *slot) { return sem_wait((sem_t *)(uintptr_t)*slot); }
+          static int b_sem_trywait(uint32_t *slot) { return sem_trywait((sem_t *)(uintptr_t)*slot); }
+          static int b_sem_post(uint32_t *slot) { return sem_post((sem_t *)(uintptr_t)*slot); }
+
+          static int b_attr_init(uint32_t *slot) { pthread_attr_t *a = calloc(1, sizeof *a); pthread_attr_init(a); *slot = U32(a); return 0; }
+          static int b_attr_destroy(uint32_t *slot) { pthread_attr_t *a = (pthread_attr_t *)(uintptr_t)*slot; if (a) { pthread_attr_destroy(a); free(a); } *slot = 0; return 0; }
+          static int b_attr_setdetachstate(uint32_t *slot, int s) { return pthread_attr_setdetachstate((pthread_attr_t *)(uintptr_t)*slot, s); }
+          static int b_attr_setstacksize(uint32_t *slot, size_t n) { return pthread_attr_setstacksize((pthread_attr_t *)(uintptr_t)*slot, n); }
+          typedef struct { void *(*fn)(void *); void *arg; } ThrBoot;
+          static void *thr_tramp(void *p) {
+            ThrBoot b = *(ThrBoot *)p; stack_t ss;
+            free(p);
+            ss.ss_sp = malloc(65536); ss.ss_size = 65536; ss.ss_flags = 0;
+            if (ss.ss_sp) sigaltstack(&ss, NULL);   /* tanpa ini, stack overflow = mati tanpa dump (handler tak bisa jalan) */
+            return b.fn(b.arg);
+          }
+          static int b_pthread_create(pthread_t *t, const uint32_t *attr, void *(*fn)(void *), void *arg) {
+            static int nlog;
+            pthread_attr_t *a = (attr && *attr > 0xFFFFu) ? (pthread_attr_t *)(uintptr_t)*attr : NULL;
+            ThrBoot *b = (ThrBoot *)malloc(sizeof *b);
+            size_t sz = 0;
+            int r;
+            if (a) { pthread_attr_getstacksize(a, &sz); if (sz < (1u << 20)) pthread_attr_setstacksize(a, 1u << 20); }
+            if (nlog++ < 20) L("[thr] pthread_create fn=%p stack_diminta=%u -> min 1MB\n", (void *)fn, (unsigned)sz);
+            if (!b) return 12;
+            b->fn = fn; b->arg = arg;
+            r = pthread_create(t, a, thr_tramp, b);
+            if (r) free(b);
+            return r;
+          }
+
+          /* --- dlopen/dlsym: libmono/libunity yang dimuat loader dikenali lewat nama; dlopen(NULL) = "__Internal" --- */
+          static void *mod_find(const Mod *m, const char *name);
+          static int g_dl_main;
+          static void *b_dlopen(const char *n, int fl) {
+            int i;
+            L("[shim] dlopen(\"%s\")\n", n ? n : "(null)");
+            if (!n) return &g_dl_main;
+            for (i = 0; i < nmods; i++) if (strstr(n, mods[i].name)) return &mods[i];
+            return dlopen(n, fl ? fl : RTLD_LAZY);
+          }
+          static void *b_dlsym(void *h, const char *s) {
+            int i; void *p;
+            if (h == &g_dl_main || h == NULL) {
+              for (i = 0; i < nmods; i++) if ((p = mod_find(&mods[i], s))) return p;
+              return dlsym(RTLD_DEFAULT, s);
+            }
+            if ((Mod *)h >= &mods[0] && (Mod *)h < &mods[MAXMOD]) return mod_find((Mod *)h, s);
+            return dlsym(h, s);
+          }
+          static int b_dlclose(void *h) { return (h && h != &g_dl_main && !((Mod *)h >= &mods[0] && (Mod *)h < &mods[MAXMOD])) ? dlclose(h) : 0; }
+          static char *b_dlerror(void) { return dlerror(); }
+
+          /* --- open(): FMOD Ex membaca /proc/cpuinfo untuk cari "vfp"/"neon" di baris Features. Kernel aarch64 tidak
+           * menampilkannya -> FMOD kira CPU tanpa VFP/NEON -> getNumDrivers = FMOD_ERR_NEEDSHARDWARE -> "Sound disabled".
+           * Solusi: kasih cpuinfo palsu bergaya ARMv7 (memfd). --- */
+          static int b_open(const char *path, int flags, ...) {
+            mode_t mode = 0;
+            if (flags & (O_CREAT | 020000000 /* O_TMPFILE */)) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, unsigned int); va_end(ap); }
+            if (path && strcmp(path, "/proc/cpuinfo") == 0) {
+              static const char fake[] =
+                "Processor\t: ARMv7 Processor rev 4 (v7l)\n"
+                "processor\t: 0\nBogoMIPS\t: 48.00\n"
+                "Features\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae\n"
+                "CPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x0\nCPU part\t: 0xc07\nCPU revision\t: 4\n\n"
+                "Hardware\t: Luxor-Loader\nRevision\t: 0000\nSerial\t\t: 0000000000000000\n";
+              int fd = memfd_create("cpuinfo", 0);
+              if (fd >= 0) {
+                if (write(fd, fake, sizeof fake - 1) == (ssize_t)(sizeof fake - 1) && lseek(fd, 0, SEEK_SET) == 0) {
+                  L("[shim] open(/proc/cpuinfo) -> cpuinfo ARMv7 palsu (vfp/neon) supaya FMOD mau pakai software mixer\n");
+                  return fd;
+                }
+                close(fd);
+              }
+            }
+            return open(path, flags, mode);
+          }
+
+          /* ---- pembungkus FP: softfp (game) -> hard-float (glibc/libm/GL) ---- */
+          AAPCS static float w_sinf(float x) { return sinf(x); }
+          AAPCS static float w_cosf(float x) { return cosf(x); }
+          AAPCS static float w_tanf(float x) { return tanf(x); }
+          AAPCS static float w_asinf(float x) { return asinf(x); }
+          AAPCS static float w_acosf(float x) { return acosf(x); }
+          AAPCS static float w_atanf(float x) { return atanf(x); }
+          AAPCS static float w_sqrtf(float x) { return sqrtf(x); }
+          AAPCS static float w_floorf(float x) { return floorf(x); }
+          AAPCS static float w_ceilf(float x) { return ceilf(x); }
+          AAPCS static float w_fabsf(float x) { return fabsf(x); }
+          AAPCS static float w_expf(float x) { return expf(x); }
+          AAPCS static float w_logf(float x) { return logf(x); }
+          AAPCS static float w_log10f(float x) { return log10f(x); }
+          AAPCS static float w_log2f(float x) { return log2f(x); }
+          AAPCS static float w_roundf(float x) { return roundf(x); }
+          AAPCS static float w_truncf(float x) { return truncf(x); }
+          AAPCS static float w_powf(float x, float y) { return powf(x, y); }
+          AAPCS static float w_atan2f(float x, float y) { return atan2f(x, y); }
+          AAPCS static float w_fmodf(float x, float y) { static float (*f)(float, float); if (!f) *(void **)&f = dlsym(RTLD_DEFAULT, "fmodf"); return f(x, y); }
+          AAPCS static double w_sin(double x) { return sin(x); }
+          AAPCS static double w_cos(double x) { return cos(x); }
+          AAPCS static double w_tan(double x) { return tan(x); }
+          AAPCS static double w_asin(double x) { return asin(x); }
+          AAPCS static double w_acos(double x) { return acos(x); }
+          AAPCS static double w_atan(double x) { return atan(x); }
+          AAPCS static double w_sqrt(double x) { return sqrt(x); }
+          AAPCS static double w_floor(double x) { return floor(x); }
+          AAPCS static double w_ceil(double x) { return ceil(x); }
+          AAPCS static double w_fabs(double x) { return fabs(x); }
+          AAPCS static double w_exp(double x) { return exp(x); }
+          AAPCS static double w_log(double x) { return log(x); }
+          AAPCS static double w_log10(double x) { return log10(x); }
+          AAPCS static double w_log2(double x) { return log2(x); }
+          AAPCS static double w_round(double x) { return round(x); }
+          AAPCS static double w_trunc(double x) { return trunc(x); }
+          AAPCS static double w_rint(double x) { return rint(x); }
+          AAPCS static double w_pow(double x, double y) { return pow(x, y); }
+          AAPCS static double w_atan2(double x, double y) { return atan2(x, y); }
+          AAPCS static double w_fmod(double x, double y) { static double (*f)(double, double); if (!f) *(void **)&f = dlsym(RTLD_DEFAULT, "fmod"); return f(x, y); }
+          AAPCS static double w_ldexp(double x, int e) { return ldexp(x, e); }
+          AAPCS static float w_ldexpf(float x, int e) { return ldexpf(x, e); }
+          AAPCS static double w_frexp(double x, int *e) { return frexp(x, e); }
+          AAPCS static float w_frexpf(float x, int *e) { return frexpf(x, e); }
+          AAPCS static long w_lrintf(float x) { return lrintf(x); }
+          AAPCS static long w_lrint(double x) { return lrint(x); }
+          AAPCS static long w_lroundf(float x) { return lroundf(x); }
+          AAPCS static double w_strtod(const char *s, char **e) { return strtod(s, e); }
+          AAPCS static float w_strtof(const char *s, char **e) { return strtof(s, e); }
+          AAPCS static double w_atof(const char *s) { return atof(s); }
+          typedef void (*gl_4f_t)(float, float, float, float);
+          typedef void (*gl_1f_t)(float);
+          AAPCS static void w_glClearColor(float r, float g, float b, float a) { static gl_4f_t f; if (!f) f = (gl_4f_t)dlsym(h_gles, "glClearColor"); f(r, g, b, a); }
+          AAPCS static void w_glClearDepthf(float d) { static gl_1f_t f; if (!f) f = (gl_1f_t)dlsym(h_gles, "glClearDepthf"); f(d); }
+
+          /* Diagnostik pencarian arsip .mjz: log strcasecmp (nama entri) dan thread-specific yang dipakai mjzFile */
+          static int g_sc_n, g_ps_n;
+          static int b_strcasecmp(const char *a, const char *b) {
+            int r = strcasecmp(a, b);
+            if (g_sc_n < 60 && (strcasestr(a, "strings") || strcasestr(b, "strings") || strcasestr(a, "english") || strcasestr(b, "english"))) { g_sc_n++; L("[sc] strcasecmp(\"%s\", \"%s\") = %d\n", a, b, r); }
+            return r;
+          }
+          static int b_key_create(unsigned *k, void (*d)(void *)) { int r = pthread_key_create(k, d); if (g_ps_n < 60) { g_ps_n++; L("[tsd] key_create -> key=%u r=%d\n", k ? *k : 0u, r); } return r; }
+          static void *b_getspecific(unsigned k) { void *v = pthread_getspecific(k); if (g_ps_n < 60) { g_ps_n++; L("[tsd] getspecific(%u) = %p\n", k, v); } return v; }
+          static int b_setspecific(unsigned k, const void *v) { int r = pthread_setspecific(k, v); if (g_ps_n < 60) { g_ps_n++; L("[tsd] setspecific(%u, %p) r=%d\n", k, v, r); } return r; }
+
+          /* ======================= shim tambahan untuk Unity 3.5 (libunity + libmono) ======================= */
+          #include <sys/syscall.h>
+          #include <netdb.h>
+          static unsigned int b_page_size = 4096;
+          static int b_data_start[4];
+          static size_t b_strlcpy(char *d, const char *s, size_t n) { size_t l = strlen(s); if (n) { size_t c = l >= n ? n - 1 : l; memcpy(d, s, c); d[c] = 0; } return l; }
+          static int b_gettid(void) { return (int)syscall(SYS_gettid); }
+          static int b_tkill(int tid, int sig) { return (int)syscall(SYS_tkill, tid, sig); }
+          static int *b_get_h_errno(void) { return &h_errno; }
+          static int b_android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
+            char buf[1024];
+            vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap);
+            L("[droid %d/%s] %s\n", prio, tag ? tag : "?", buf);
+            return 1;
+          }
+          static void b_cxa_finalize(void *d) { (void)d; }
+          static int b_atexit(void (*fn)(void)) {
+            extern int __cxa_atexit(void (*)(void *), void *, void *);
+            return __cxa_atexit((void (*)(void *))fn, NULL, NULL);
+          }
+          /* cleanup push/pop bionic */
+          typedef struct { void *prev; void (*routine)(void *); void *arg; } BCleanup;
+          static void b_cleanup_push(BCleanup *c, void (*r)(void *), void *a) { c->prev = NULL; c->routine = r; c->arg = a; }
+          static void b_cleanup_pop(BCleanup *c, int ex) { if (ex && c->routine) c->routine(c->arg); }
+
+          /* unwinder EHABI: cari tabel exidx modul yang memuat pc */
+          static uintptr_t b_find_exidx(uintptr_t pc, int *pcount) {
+            int i;
+            for (i = 0; i < nmods; i++) {
+              Mod *m = &mods[i];
+              if (pc >= (uintptr_t)m->base && pc < (uintptr_t)m->base + m->span) {
+                const Elf32_Ehdr *eh = (const Elf32_Ehdr *)m->file;
+                const Elf32_Phdr *ph = (const Elf32_Phdr *)(m->file + eh->e_phoff);
+                int k;
+                for (k = 0; k < eh->e_phnum; k++) if (ph[k].p_type == 0x70000001u) { *pcount = (int)(ph[k].p_memsz / 8); return m->bias + ph[k].p_vaddr; }
+              }
+            }
+            *pcount = 0; return 0;
+          }
+
+          /* sysconf: konstanta bionic != glibc */
+          static long b_sysconf(int n) {
+            switch (n) {
+              case 0x27: case 0x28: return sysconf(_SC_PAGESIZE);
+              case 0x60: return sysconf(_SC_NPROCESSORS_CONF);
+              case 0x61: return sysconf(_SC_NPROCESSORS_ONLN);
+              case 0x62: return sysconf(_SC_PHYS_PAGES);
+              case 0x63: return sysconf(_SC_AVPHYS_PAGES);
+              case 0x02: return sysconf(_SC_CLK_TCK);
+              case 0x04: return sysconf(_SC_OPEN_MAX);
+              default: { static int nl; if (nl++ < 10) L("[shim] sysconf(0x%x) tak dikenal -> -1\n", n); errno = EINVAL; return -1; }
+            }
+          }
+          /* fpos_t bionic = 4 byte */
+          static int b_fgetpos(FILE *f, int32_t *pos) { long p = ftell(xf(f)); if (p < 0) return -1; *pos = (int32_t)p; return 0; }
+          static int b_fsetpos(FILE *f, const int32_t *pos) { return fseek(xf(f), (long)*pos, SEEK_SET); }
+
+          /* semaphore tambahan */
+          static int b_sem_timedwait(uint32_t *slot, const struct timespec *t) { return sem_timedwait((sem_t *)(uintptr_t)*slot, t); }
+          static int b_sem_getvalue(uint32_t *slot, int *v) { return sem_getvalue((sem_t *)(uintptr_t)*slot, v); }
+
+          /* pthread_attr tambahan (slot berisi pointer ke attr glibc) */
+          static pthread_attr_t *attr_of(const uint32_t *slot) { return (pthread_attr_t *)(uintptr_t)*slot; }
+          static int b_getattr_np(pthread_t t, uint32_t *slot) {
+            pthread_attr_t *a = calloc(1, sizeof *a); int r;
+            if (!a) return 12;
+            r = pthread_getattr_np(t, a);
+            if (r) { free(a); *slot = 0; return r; }
+            *slot = U32(a); return 0;
+          }
+          static int b_attr_getstack(const uint32_t *slot, void **addr, size_t *sz) { return pthread_attr_getstack(attr_of(slot), addr, sz); }
+          static int b_attr_getdetachstate(const uint32_t *slot, int *st) { return pthread_attr_getdetachstate(attr_of(slot), st); }
+          static int b_attr_setschedpolicy(uint32_t *slot, int p) { return pthread_attr_setschedpolicy(attr_of(slot), p); }
+          static int b_attr_setschedparam(uint32_t *slot, const struct sched_param *p) { return pthread_attr_setschedparam(attr_of(slot), p); }
+
+          /* sinyal: struct sigaction & sigset_t bionic (32-bit) != glibc */
+          typedef struct { void *handler; uint32_t mask; int flags; void *restorer; } BSigAct;
+          static void bset(uint32_t b, sigset_t *s) { int k; sigemptyset(s); for (k = 0; k < 32; k++) if (b & (1u << k)) sigaddset(s, k + 1); }
+          static uint32_t gset(const sigset_t *s) { int k; uint32_t b = 0; for (k = 0; k < 32; k++) if (sigismember(s, k + 1) == 1) b |= 1u << k; return b; }
+          static int b_sigaction(int sig, const BSigAct *act, BSigAct *old) {
+            struct sigaction na, oa; int r; static int nl;
+            memset(&na, 0, sizeof na); memset(&oa, 0, sizeof oa);
+            if (act) {
+              na.sa_sigaction = (void (*)(int, siginfo_t *, void *))act->handler;
+              bset(act->mask, &na.sa_mask);
+              na.sa_flags = act->flags & ~0x04000000;
+              if (nl++ < 20) L("[shim] sigaction(%d) handler=%p flags=0x%x\n", sig, act->handler, (unsigned)act->flags);
+            }
+            r = sigaction(sig, act ? &na : NULL, old ? &oa : NULL);
+            if (r == 0 && old) { memset(old, 0, sizeof *old); old->handler = (void *)oa.sa_sigaction; old->mask = gset(&oa.sa_mask); old->flags = oa.sa_flags; }
+            return r;
+          }
+          static int b_sigprocmask(int how, const uint32_t *set, uint32_t *old) {
+            sigset_t ns, os; int r;
+            if (set) bset(*set, &ns);
+            r = sigprocmask(how, set ? &ns : NULL, old ? &os : NULL);
+            if (r == 0 && old) *old = gset(&os);
+            return r;
+          }
+          static int b_pthread_sigmask(int how, const uint32_t *set, uint32_t *old) {
+            sigset_t ns, os; int r;
+            if (set) bset(*set, &ns);
+            r = pthread_sigmask(how, set ? &ns : NULL, old ? &os : NULL);
+            if (r == 0 && old) *old = gset(&os);
+            return r;
+          }
+          static int b_sigsuspend(const uint32_t *set) { sigset_t ns; bset(set ? *set : 0, &ns); return sigsuspend(&ns); }
+          static void *b_bsd_signal(int sig, void *h) { return (void *)signal(sig, (void (*)(int))h); }
+
+          /* SHA1 gaya BSD (libc bionic): SHA1Init/Update/Final */
+          typedef struct { uint32_t state[5]; uint32_t count[2]; uint8_t buffer[64]; } BSha1;
+          #define ROL(v, b) (((v) << (b)) | ((v) >> (32 - (b))))
+          static void sha1_tr(uint32_t st[5], const uint8_t *p) {
+            uint32_t w[80], a, b, c, d, e, t; int i;
+            for (i = 0; i < 16; i++) w[i] = ((uint32_t)p[i*4] << 24) | ((uint32_t)p[i*4+1] << 16) | ((uint32_t)p[i*4+2] << 8) | p[i*4+3];
+            for (i = 16; i < 80; i++) w[i] = ROL(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+            a = st[0]; b = st[1]; c = st[2]; d = st[3]; e = st[4];
+            for (i = 0; i < 80; i++) {
+              uint32_t f, k;
+              if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999u; }
+              else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1u; }
+              else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCu; }
+              else { f = b ^ c ^ d; k = 0xCA62C1D6u; }
+              t = ROL(a, 5) + f + e + k + w[i]; e = d; d = c; c = ROL(b, 30); b = a; a = t;
+            }
+            st[0] += a; st[1] += b; st[2] += c; st[3] += d; st[4] += e;
+          }
+          static void b_SHA1Init(BSha1 *c) { c->state[0] = 0x67452301u; c->state[1] = 0xEFCDAB89u; c->state[2] = 0x98BADCFEu; c->state[3] = 0x10325476u; c->state[4] = 0xC3D2E1F0u; c->count[0] = c->count[1] = 0; }
+          static void b_SHA1Update(BSha1 *c, const uint8_t *d, unsigned len) {
+            unsigned i, j = (c->count[0] >> 3) & 63;
+            if ((c->count[0] += len << 3) < (len << 3)) c->count[1]++;
+            c->count[1] += len >> 29;
+            if (j + len > 63) {
+              memcpy(&c->buffer[j], d, (i = 64 - j)); sha1_tr(c->state, c->buffer);
+              for (; i + 63 < len; i += 64) sha1_tr(c->state, &d[i]);
+              j = 0;
+            } else i = 0;
+            memcpy(&c->buffer[j], &d[i], len - i);
+          }
+          static void b_SHA1Final(uint8_t dig[20], BSha1 *c) {
+            uint8_t fc[8], pad = 0x80, z = 0; int i;
+            for (i = 0; i < 8; i++) fc[i] = (uint8_t)((c->count[(i >= 4) ? 0 : 1] >> ((3 - (i & 3)) * 8)) & 255);
+            b_SHA1Update(c, &pad, 1);
+            while ((c->count[0] & 504) != 448) b_SHA1Update(c, &z, 1);
+            b_SHA1Update(c, fc, 8);
+            for (i = 0; i < 20; i++) dig[i] = (uint8_t)((c->state[i >> 2] >> ((3 - (i & 3)) * 8)) & 255);
+          }
+
+          typedef struct { const char *name; void *addr; } Shim;
+          static const Shim shim[] = {
+            {"__errno", (void *)b_errno}, {"__android_log_print", (void *)b_android_log_print},
+            {"__android_log_write", (void *)b_android_log_write}, {"__assert2", (void *)b_assert2},
+            {"__aeabi_atexit", (void *)b_aeabi_atexit}, {"__register_frame_info", (void *)b_register_frame_info},
+            {"__deregister_frame_info", (void *)b_deregister_frame_info}, {"_Jv_RegisterClasses", (void *)b_jv_register},
+            {"__stack_chk_guard", &b_stack_chk_guard}, {"__sF", bionic_sF}, {"_ctype_", &p_ctype}, {"_tolower_tab_", &p_tolower}, {"_toupper_tab_", &p_toupper},
+            {"__srget", (void *)b_srget}, {"__swbuf", (void *)b_swbuf},
+            {"fprintf", (void *)b_fprintf}, {"vfprintf", (void *)b_vfprintf}, {"fputs", (void *)b_fputs}, {"fputc", (void *)b_fputc},
+            {"putc", (void *)b_fputc}, {"fwrite", (void *)b_fwrite}, {"fread", (void *)b_fread}, {"fflush", (void *)b_fflush},
+            {"fgets", (void *)b_fgets}, {"fgetc", (void *)b_fgetc}, {"getc", (void *)b_fgetc},
+            {"stat", (void *)b_stat}, {"fstat", (void *)b_fstat}, {"lstat", (void *)b_lstat},
+            {"readdir", (void *)readdir64}, {"readdir_r", (void *)readdir64_r}, {"scandir", (void *)scandir64}, {"alphasort", (void *)alphasort64},
+            {"setjmp", (void *)_setjmp}, {"_setjmp", (void *)_setjmp},
+            {"pthread_mutex_init", (void *)b_mutex_init}, {"pthread_mutex_destroy", (void *)b_mutex_destroy},
+            {"pthread_mutex_lock", (void *)b_mutex_lock}, {"pthread_mutex_unlock", (void *)b_mutex_unlock},
+            {"pthread_mutex_trylock", (void *)b_mutex_trylock}, {"pthread_mutexattr_init", (void *)b_mutexattr_init},
+            {"pthread_mutexattr_settype", (void *)b_mutexattr_settype}, {"pthread_mutexattr_gettype", (void *)b_mutexattr_gettype},
+            {"pthread_mutexattr_destroy", (void *)b_mutexattr_destroy},
+            {"pthread_cond_init", (void *)b_cond_init}, {"pthread_cond_destroy", (void *)b_cond_destroy},
+            {"pthread_cond_wait", (void *)b_cond_wait}, {"pthread_cond_timedwait", (void *)b_cond_timedwait},
+            {"pthread_cond_signal", (void *)b_cond_signal}, {"pthread_cond_broadcast", (void *)b_cond_broadcast},
+            {"pthread_condattr_init", (void *)b_condattr_init}, {"pthread_condattr_destroy", (void *)b_condattr_destroy},
+            {"sem_init", (void *)b_sem_init}, {"sem_destroy", (void *)b_sem_destroy}, {"sem_wait", (void *)b_sem_wait},
+            {"sem_trywait", (void *)b_sem_trywait}, {"sem_post", (void *)b_sem_post},
+            {"pthread_attr_init", (void *)b_attr_init}, {"pthread_attr_destroy", (void *)b_attr_destroy},
+            {"pthread_attr_setdetachstate", (void *)b_attr_setdetachstate}, {"pthread_attr_setstacksize", (void *)b_attr_setstacksize},
+            {"pthread_create", (void *)b_pthread_create},
+            {"strcasecmp", (void *)b_strcasecmp}, {"pthread_key_create", (void *)b_key_create}, {"pthread_getspecific", (void *)b_getspecific}, {"pthread_setspecific", (void *)b_setspecific},
+            {"open", (void *)b_open}, {"dlopen", (void *)b_dlopen}, {"dlsym", (void *)b_dlsym}, {"dlclose", (void *)b_dlclose}, {"dlerror", (void *)b_dlerror},
+            {"sinf", (void *)w_sinf}, {"cosf", (void *)w_cosf}, {"tanf", (void *)w_tanf}, {"asinf", (void *)w_asinf},
+            {"acosf", (void *)w_acosf}, {"atanf", (void *)w_atanf}, {"sqrtf", (void *)w_sqrtf}, {"floorf", (void *)w_floorf},
+            {"ceilf", (void *)w_ceilf}, {"fabsf", (void *)w_fabsf}, {"expf", (void *)w_expf}, {"logf", (void *)w_logf},
+            {"log10f", (void *)w_log10f}, {"log2f", (void *)w_log2f}, {"roundf", (void *)w_roundf},
+            {"truncf", (void *)w_truncf}, {"powf", (void *)w_powf}, {"atan2f", (void *)w_atan2f}, {"fmodf", (void *)w_fmodf},
+            {"sin", (void *)w_sin}, {"cos", (void *)w_cos}, {"tan", (void *)w_tan}, {"asin", (void *)w_asin},
+            {"acos", (void *)w_acos}, {"atan", (void *)w_atan}, {"sqrt", (void *)w_sqrt}, {"floor", (void *)w_floor},
+            {"ceil", (void *)w_ceil}, {"fabs", (void *)w_fabs}, {"exp", (void *)w_exp}, {"log", (void *)w_log},
+            {"log10", (void *)w_log10}, {"log2", (void *)w_log2}, {"round", (void *)w_round}, {"trunc", (void *)w_trunc},
+            {"rint", (void *)w_rint}, {"pow", (void *)w_pow}, {"atan2", (void *)w_atan2}, {"fmod", (void *)w_fmod},
+            {"ldexp", (void *)w_ldexp}, {"ldexpf", (void *)w_ldexpf}, {"frexp", (void *)w_frexp}, {"frexpf", (void *)w_frexpf},
+            {"lrintf", (void *)w_lrintf}, {"lrint", (void *)w_lrint}, {"lroundf", (void *)w_lroundf},
+            {"strtod", (void *)w_strtod}, {"strtof", (void *)w_strtof}, {"atof", (void *)w_atof},
+            {"glClearColor", (void *)w_glClearColor}, {"glClearDepthf", (void *)w_glClearDepthf},
+            {"__page_size", &b_page_size}, {"data_start", b_data_start}, {"strlcpy", (void *)b_strlcpy}, {"gettid", (void *)b_gettid},
+            {"tkill", (void *)b_tkill}, {"__get_h_errno", (void *)b_get_h_errno}, {"__android_log_vprint", (void *)b_android_log_vprint},
+            {"__cxa_finalize", (void *)b_cxa_finalize}, {"atexit", (void *)b_atexit},
+            {"__pthread_cleanup_push", (void *)b_cleanup_push}, {"__pthread_cleanup_pop", (void *)b_cleanup_pop},
+            {"__gnu_Unwind_Find_exidx", (void *)b_find_exidx}, {"sysconf", (void *)b_sysconf},
+            {"fgetpos", (void *)b_fgetpos}, {"fsetpos", (void *)b_fsetpos},
+            {"sem_timedwait", (void *)b_sem_timedwait}, {"sem_getvalue", (void *)b_sem_getvalue},
+            {"pthread_getattr_np", (void *)b_getattr_np}, {"pthread_attr_getstack", (void *)b_attr_getstack},
+            {"pthread_attr_getdetachstate", (void *)b_attr_getdetachstate}, {"pthread_attr_setschedpolicy", (void *)b_attr_setschedpolicy},
+            {"pthread_attr_setschedparam", (void *)b_attr_setschedparam},
+            {"sigaction", (void *)b_sigaction}, {"sigprocmask", (void *)b_sigprocmask}, {"pthread_sigmask", (void *)b_pthread_sigmask},
+            {"sigsuspend", (void *)b_sigsuspend}, {"bsd_signal", (void *)b_bsd_signal}, {"sigsetjmp", (void *)__sigsetjmp},
+            {"SHA1Init", (void *)b_SHA1Init}, {"SHA1Update", (void *)b_SHA1Update}, {"SHA1Final", (void *)b_SHA1Final},
+            {NULL, NULL}
+          };
+
+          /* ======================= JNI palsu (model objek sederhana + log panggilan Java) ======================= */
+          typedef union { int32_t i; int64_t j; float f; double d; void *l; } jv;
+
+          static const void *g_jni_table[256];
+          static const void *g_vm_table[16];
+          static const void *g_envobj = g_jni_table;
+          static const void *g_vmobj = g_vm_table;
+          static char *reg_str[4096];
+          static int reg_n, obj_serial;
+          static char g_apk[512];
+
+          static void *mk_handle(const char *what, const char *s) {
+            int i;
+            (void)what;
+            for (i = 0; i < reg_n; i++) if (strcmp(reg_str[i], s) == 0) return (void *)(uintptr_t)(0x70000000u + (uint32_t)i * 4u);
+            if (reg_n >= 4096) return (void *)(uintptr_t)0x70000000u;
+            reg_str[reg_n] = strdup(s);
+            return (void *)(uintptr_t)(0x70000000u + (uint32_t)(reg_n++) * 4u);
+          }
+          static const char *h2s(void *h) {
+            uintptr_t v = (uintptr_t)h;
+            if (v >= 0x70000000u && ((v - 0x70000000u) / 4u) < (uintptr_t)reg_n) return reg_str[(v - 0x70000000u) / 4u];
+            return "?";
+          }
+          static void *mk_obj(const char *cls) { char b[200]; snprintf(b, sizeof b, "obj:%s#%d", cls, ++obj_serial); return mk_handle("object", b); }
+
+          typedef struct { char cls[96]; char name[64]; char sig[128]; int is_static; unsigned count; } MInfo;
+          static MInfo minfo[512];
+          static int nminfo;
+          static int jlog_budget = 600;
+
+          static void *mk_method(const char *cls, const char *name, const char *sig, int st) {
+            int i;
+            for (i = 0; i < nminfo; i++)
+              if (!strcmp(minfo[i].cls, cls) && !strcmp(minfo[i].name, name) && !strcmp(minfo[i].sig, sig) && minfo[i].is_static == st)
+                return (void *)(uintptr_t)(0x71000000u + (uint32_t)i * 4u);
+            if (nminfo >= 512) i = 511; else i = nminfo++;
+            snprintf(minfo[i].cls, sizeof minfo[i].cls, "%s", cls);
+            snprintf(minfo[i].name, sizeof minfo[i].name, "%s", name);
+            snprintf(minfo[i].sig, sizeof minfo[i].sig, "%s", sig);
+            minfo[i].is_static = st; minfo[i].count = 0;
+            L("[JNI] %s: %s.%s%s\n", st ? "GetStaticMethodID" : "GetMethodID", cls, name, sig);
+            return (void *)(uintptr_t)(0x71000000u + (uint32_t)i * 4u);
+          }
+          static MInfo *mi_get(void *mid) {
+            uintptr_t v = (uintptr_t)mid;
+            if (v >= 0x71000000u && ((v - 0x71000000u) / 4u) < (uintptr_t)nminfo) return &minfo[(v - 0x71000000u) / 4u];
+            return NULL;
+          }
+
+          /* ---- asset di dalam APK (Android: AssetFileDescriptor.getStartOffset/getLength; hanya valid untuk entri tanpa kompresi) ---- */
+          static int apk_find(const char *apk, const char *entry, uint32_t *off, uint32_t *len, int *method) {
+            FILE *f = fopen(apk, "rb");
+            uint8_t tail[66000], *cd, lh[30];
+            long fsz, tn, i, p = -1;
+            uint32_t cdsz, cdoff, k, pos;
+            unsigned ent, e;
+            int found = -1;
+            if (!f) return -1;
+            fseek(f, 0, SEEK_END); fsz = ftell(f);
+            tn = fsz < (long)sizeof tail ? fsz : (long)sizeof tail;
+            fseek(f, fsz - tn, SEEK_SET);
+            if (fread(tail, 1, (size_t)tn, f) != (size_t)tn) { fclose(f); return -1; }
+            for (i = tn - 22; i >= 0; i--) if (tail[i] == 0x50 && tail[i+1] == 0x4b && tail[i+2] == 5 && tail[i+3] == 6) { p = i; break; }
+            if (p < 0) { fclose(f); return -1; }
+            ent = tail[p+10] | (tail[p+11] << 8);
+            cdsz = tail[p+12] | (tail[p+13] << 8) | (tail[p+14] << 16) | ((uint32_t)tail[p+15] << 24);
+            cdoff = tail[p+16] | (tail[p+17] << 8) | (tail[p+18] << 16) | ((uint32_t)tail[p+19] << 24);
+            cd = malloc(cdsz);
+            fseek(f, (long)cdoff, SEEK_SET);
+            if (!cd || fread(cd, 1, cdsz, f) != cdsz) { free(cd); fclose(f); return -1; }
+            for (e = 0, k = 0; e < ent && k + 46 <= cdsz; e++) {
+              unsigned nl = cd[k+28] | (cd[k+29] << 8), el = cd[k+30] | (cd[k+31] << 8), cl = cd[k+32] | (cd[k+33] << 8);
+              if (nl == strlen(entry) && memcmp(cd + k + 46, entry, nl) == 0) {
+                uint32_t lho = cd[k+42] | (cd[k+43] << 8) | (cd[k+44] << 16) | ((uint32_t)cd[k+45] << 24);
+                *method = cd[k+10] | (cd[k+11] << 8);
+                *len = cd[k+24] | (cd[k+25] << 8) | (cd[k+26] << 16) | ((uint32_t)cd[k+27] << 24);
+                fseek(f, (long)lho, SEEK_SET);
+                if (fread(lh, 1, 30, f) == 30 && lh[0] == 0x50 && lh[1] == 0x4b && lh[2] == 3 && lh[3] == 4) {
+                  pos = lho + 30 + (lh[26] | (lh[27] << 8)) + (lh[28] | (lh[29] << 8));
+                  *off = pos; found = 0;
+                }
+                break;
+              }
+              k += 46 + nl + el + cl;
+            }
+            free(cd); fclose(f);
+            return found;
+          }
+
+          /* ---- argumen varargs / jvalue ---- */
+          static int sig_nargs(const char *sig) {
+            const char *p = sig + 1; int n = 0;
+            while (*p && *p != ')') {
+              while (*p == '[') p++;
+              if (*p == 'L') { while (*p && *p != ';') p++; }
+              if (*p) p++;
+              n++;
+            }
+            return n;
+          }
+          static int collect_va(const char *sig, va_list ap, jv *out) {
+            const char *p = sig + 1; int n = 0;
+            while (*p && *p != ')' && n < 16) {
+              int arr = 0;
+              memset(&out[n], 0, sizeof out[n]);
+              while (*p == '[') { arr = 1; p++; }
+              if (*p == 'L' || arr) {
+                out[n].l = va_arg(ap, void *);
+                if (*p == 'L') { while (*p && *p != ';') p++; }
+              } else switch (*p) {
+                case 'J': out[n].j = va_arg(ap, int64_t); break;
+                case 'F': out[n].f = (float)va_arg(ap, double); break;
+                case 'D': out[n].d = va_arg(ap, double); break;
+                default: out[n].i = va_arg(ap, int); break;
+              }
+              if (*p) p++;
+              n++;
+            }
+            return n;
+          }
+          static void fmt_args(const MInfo *m, const jv *a, char *buf, size_t sz) {
+            const char *p = m->sig + 1; int n = 0; size_t o = 0;
+            buf[0] = 0;
+            while (*p && *p != ')' && n < 16 && o + 80 < sz) {
+              int arr = 0;
+              while (*p == '[') { arr = 1; p++; }
+              if (*p == 'L' || arr) {
+                const char *s = h2s(a[n].l);
+                if (*s != '?' && strncmp(s, "obj:", 4) != 0) o += (size_t)snprintf(buf + o, sz - o, "\"%.60s\"", s);
+                else o += (size_t)snprintf(buf + o, sz - o, "%p", a[n].l);
+                if (*p == 'L') { while (*p && *p != ';') p++; }
+              } else switch (*p) {
+                case 'J': o += (size_t)snprintf(buf + o, sz - o, "%lld", (long long)a[n].j); break;
+                case 'F': o += (size_t)snprintf(buf + o, sz - o, "%g", (double)a[n].f); break;
+                case 'D': o += (size_t)snprintf(buf + o, sz - o, "%g", a[n].d); break;
+                default: o += (size_t)snprintf(buf + o, sz - o, "%d", a[n].i); break;
+              }
+              if (*p) p++;
+              n++;
+              if (*p && *p != ')') o += (size_t)snprintf(buf + o, sz - o, ", ");
+            }
+          }
+
+          /* Diagnostik: bongkar daftar entri arsip .mjz di dalam APK (header 16B: magic "MJZ0", jumlah entri di +8; tiap entri: 17B + nama[len=byte 16]) */
+          static void mjz_dump(const char *ent, const char *want, int maxshow) {
+            uint32_t off = 0, len = 0, cnt, i; int method = -1, shown = 0, hits = 0;
+            unsigned char h[16], rec[17]; char nm[300]; FILE *f;
+            if (apk_find(g_apk, ent, &off, &len, &method) != 0) { L("[mjz] %s: tidak ada di APK\n", ent); return; }
+            f = fopen(g_apk, "rb");
+            if (!f) { L("[mjz] gagal buka APK\n"); return; }
+            if (fseek(f, (long)off, SEEK_SET) != 0 || fread(h, 1, 16, f) != 16) { L("[mjz] %s: gagal baca header\n", ent); fclose(f); return; }
+            cnt = (uint32_t)h[8] | ((uint32_t)h[9] << 8) | ((uint32_t)h[10] << 16) | ((uint32_t)h[11] << 24);
+            L("[mjz] %s: off=%u len=%u magic=%c%c%c%c hdr=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x entri=%u\n", ent, off, len,
+              (h[0] >= 32 && h[0] < 127) ? h[0] : '?', (h[1] >= 32 && h[1] < 127) ? h[1] : '?', (h[2] >= 32 && h[2] < 127) ? h[2] : '?', (h[3] >= 32 && h[3] < 127) ? h[3] : '?',
+              h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15], cnt);
+            for (i = 0; i < cnt && i < 200000; i++) {
+              unsigned nl;
+              if (fread(rec, 1, 17, f) != 17) { L("[mjz] entri %u: baca record gagal\n", i); break; }
+              nl = rec[16];
+              if (nl >= sizeof nm || fread(nm, 1, nl, f) != nl) { L("[mjz] entri %u: nama gagal (len=%u)\n", i, nl); break; }
+              nm[nl] = 0;
+              if (shown < maxshow) { L("[mjz]   #%u \"%s\" rec=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n", i, nm,
+                rec[0], rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], rec[7], rec[8], rec[9], rec[10], rec[11], rec[12], rec[13], rec[14], rec[15]); shown++; }
+              if (want && strcasestr(nm, want) && hits < 20) { hits++; L("[mjz]   COCOK \"%s\": #%u \"%s\"\n", want, i, nm); }
+            }
+            fclose(f);
+          }
+
+          static void java_invoke(void *mid, const jv *a, jv *r) {
+            MInfo *m = mi_get(mid);
+            const char *rp;
+            char rt, args[400];
+            memset(r, 0, sizeof *r);
+            if (!m) { L("[Java] methodID tak dikenal: %p\n", mid); return; }
+            rp = strchr(m->sig, ')');
+            rt = rp ? rp[1] : 'V';
+            m->count++;
+            fmt_args(m, a, args, sizeof args);
+            if (jlog_budget > 0 || m->count <= 3) { L("[Java] %s.%s(%s) -> %c\n", m->cls, m->name, args, rt); if (jlog_budget > 0) jlog_budget--; }
+            if (!strcmp(m->name, "terminateActivity")) print_game_trace("terminateActivity dipanggil game");
+            if (!strcmp(m->name, "getRawAssetFileOffset") || !strcmp(m->name, "getRawAssetFileLength")) {
+              const char *arg = h2s(a[0].l);
+              char ent[512]; uint32_t off = 0, len = 0; int method = -1;
+              /* Absolute filesystem paths are not APK asset names. */
+              if (arg[0] == '/') {
+                struct stat st;
+                if (stat(arg, &st) == 0) {
+                  if (m->count <= 8) L("[asset] path filesystem ADA: %s (size=%lld); bukan entri APK, return 0 (game lalu fopen biasa)\n", arg, (long long)st.st_size);
+                } else {
+                  if (m->count <= 8) L("[asset] path filesystem TIDAK ADA: %s (errno=%d); bukan entri APK, return 0 (game lalu fopen biasa)\n", arg, errno);
+                }
+                r->j = 0; /* offset+panjang==0 => native pakai fopen(path) biasa; -1 dianggap entri APK di offset -1 */
+              } else {
+                snprintf(ent, sizeof ent, "assets/%s", arg);
+                if (apk_find(g_apk, ent, &off, &len, &method) == 0) {
+                  if (method != 0) L("[asset] PERINGATAN: %s terkompresi (method %d); native tidak bisa membaca langsung\n", ent, method);
+                  r->j = !strcmp(m->name, "getRawAssetFileOffset") ? (int64_t)off : (int64_t)len;
+                  if (m->count <= 5) L("[asset] %s -> offset=%u panjang=%u method=%d\n", ent, off, len, method);
+                } else {
+                  if (m->count <= 8) L("[asset] TIDAK ADA di APK (%s): %s\n", g_apk, ent);
+                  r->j = 0;
+                }
+              }
+            } else if (!strcmp(m->name, "getLanguageCode")) {
+              r->l = mk_handle("string", "en");
+            } else if (rt == 'L' && rp && !strcmp(rp + 1, "Ljava/lang/String;")) {
+              r->l = mk_handle("string", "");
+            }
+          }
+
+          #define PREP_VA(mid, ap, a) do { MInfo *mi_ = mi_get(mid); if (mi_) collect_va(mi_->sig, ap, a); } while (0)
+
+          #define DEFCALL(NAME, CT, ATTR, CONV) \
+            ATTR static CT j_Call##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); return CONV; } \
+            ATTR static CT j_Call##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); return CONV; } \
+            ATTR static CT j_Call##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); return CONV; } \
+            ATTR static CT j_CallStatic##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); return CONV; } \
+            ATTR static CT j_CallStatic##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); return CONV; } \
+            ATTR static CT j_CallStatic##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); return CONV; }
+
+          DEFCALL(Object, void *, , r.l)
+          DEFCALL(Boolean, uint8_t, , (uint8_t)r.i)
+          DEFCALL(Byte, int8_t, , (int8_t)r.i)
+          DEFCALL(Char, uint16_t, , (uint16_t)r.i)
+          DEFCALL(Short, int16_t, , (int16_t)r.i)
+          DEFCALL(Int, int32_t, , r.i)
+          DEFCALL(Long, int64_t, , r.j)
+          DEFCALL(Float, float, AAPCS, r.f)
+          DEFCALL(Double, double, AAPCS, r.d)
+
+          #define DEFCALLV(NAME) \
+            static void j_Call##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); } \
+            static void j_Call##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); } \
+            static void j_Call##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); } \
+            static void j_CallStatic##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); } \
+            static void j_CallStatic##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); } \
+            static void j_CallStatic##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); }
+          DEFCALLV(Void)
+
+          static int jni_trap(int i) { L("[JNI] slot %d (%s) dipanggil, belum diimplementasi -> return 0\n", i, jni_names[i]); return 0; }
+
+          static int j_GetVersion(void *env) { (void)env; return 0x00010006; }
+          static void *j_FindClass(void *env, const char *n) { (void)env; L("[JNI] FindClass(\"%s\")\n", n); return mk_handle("class", n); }
+          static void *j_GetObjectClass(void *env, void *o) {
+            const char *s = h2s(o); char b[160]; const char *p, *q; (void)env;
+            if (!strncmp(s, "obj:", 4)) { p = s + 4; q = strrchr(p, '#'); snprintf(b, sizeof b, "%.*s", q ? (int)(q - p) : (int)strlen(p), p); return mk_handle("class", b); }
+            return mk_handle("class", "(object-class)");
+          }
+          static void *j_GetMethodID(void *env, void *cls, const char *n, const char *sig) { (void)env; return mk_method(h2s(cls), n, sig, 0); }
+          static void *j_GetStaticMethodID(void *env, void *cls, const char *n, const char *sig) { (void)env; return mk_method(h2s(cls), n, sig, 1); }
+          static void *j_GetFieldID(void *env, void *cls, const char *n, const char *sig) {
+            char buf[512]; (void)env;
+            L("[JNI] GetFieldID/GetStaticFieldID(%s, \"%s\", \"%s\")\n", h2s(cls), n, sig);
+            snprintf(buf, sizeof buf, "F:%s:%s%s", h2s(cls), n, sig);
+            return mk_handle("field", buf);
+          }
+          static void *j_NewObject(void *env, void *cls, void *mid, ...) { (void)env; (void)mid; L("[JNI] NewObject(%s)\n", h2s(cls)); return mk_obj(h2s(cls)); }
+          static void *j_NewObjectV(void *env, void *cls, void *mid, va_list ap) { (void)env; (void)mid; (void)ap; L("[JNI] NewObjectV(%s)\n", h2s(cls)); return mk_obj(h2s(cls)); }
+          static void *j_NewObjectA(void *env, void *cls, void *mid, const jv *a) { (void)env; (void)mid; (void)a; L("[JNI] NewObjectA(%s)\n", h2s(cls)); return mk_obj(h2s(cls)); }
+          static void *j_AllocObject(void *env, void *cls) { (void)env; return mk_obj(h2s(cls)); }
+          static void *j_ident(void *env, void *o) { (void)env; return o; }
+          static void j_void2(void *env, void *o) { (void)env; (void)o; }
+          static void j_void1(void *env) { (void)env; }
+          static int j_zero1(void *env) { (void)env; return 0; }
+          static int j_zero2(void *env, int x) { (void)env; (void)x; return 0; }
+          static void *j_NewStringUTF(void *env, const char *s) { (void)env; return mk_handle("string", s ? s : ""); }
+          static int j_GetStringUTFLength(void *env, void *s) { (void)env; return (int)strlen(h2s(s)); }
+          static const char *j_GetStringUTFChars(void *env, void *s, unsigned char *copy) {
+            const char *t = h2s(s); (void)env;
+            if (copy) *copy = 0;
+            if (*t == '?' && t[1] == 0) L("[JNI] GetStringUTFChars: handle %p bukan string terdaftar\n", s);
+            return t;
+          }
+          static void j_ReleaseStringUTFChars(void *env, void *s, const char *c) { (void)env; (void)s; (void)c; }
+          static int j_GetStringLength(void *env, void *s) { (void)env; return (int)strlen(h2s(s)); }
+          static const uint16_t *j_GetStringChars(void *env, void *s, unsigned char *copy) {
+            const char *t = h2s(s); size_t i, n = strlen(t); uint16_t *b = malloc((n + 1) * 2); (void)env;
+            for (i = 0; i < n; i++) b[i] = (uint8_t)t[i];
+            b[n] = 0; if (copy) *copy = 1;
+            return b;
+          }
+          static void j_ReleaseStringChars(void *env, void *s, const uint16_t *c) { (void)env; (void)s; free((void *)c); }
+          static void *j_NewString(void *env, const uint16_t *u, int n) {
+            char *t = malloc((size_t)n + 1); int i; void *h; (void)env;
+            for (i = 0; i < n; i++) t[i] = (char)u[i];
+            t[n] = 0; h = mk_handle("string", t); free(t);
+            return h;
+          }
+          typedef struct { const char *name; const char *sig; void *fn; } NativeMethod;
+          typedef struct { char cls[96]; char name[64]; char sig[128]; void *fn; } Native;
+          static Native g_nat[256];
+          static int g_nnat;
+          static void *nat_find(const char *name) {
+            int i;
+            for (i = 0; i < g_nnat; i++) if (!strcmp(g_nat[i].name, name)) return g_nat[i].fn;
+            return NULL;
+          }
+          static const char *nat_sig(const char *name) {
+            int i;
+            for (i = 0; i < g_nnat; i++) if (!strcmp(g_nat[i].name, name)) return g_nat[i].sig;
+            return "";
+          }
+          static int j_RegisterNatives(void *env, void *cls, const NativeMethod *m, int n) {
+            int i; (void)env;
+            L("[JNI] RegisterNatives(%s, %d metode)\n", h2s(cls), n);
+            for (i = 0; i < n; i++) {
+              L("[JNI]   %s %s -> %p\n", m[i].name, m[i].sig, m[i].fn);
+              if (g_nnat < 256) {
+                Native *t = &g_nat[g_nnat++];
+                snprintf(t->cls, sizeof t->cls, "%s", h2s(cls));
+                snprintf(t->name, sizeof t->name, "%s", m[i].name);
+                snprintf(t->sig, sizeof t->sig, "%s", m[i].sig);
+                t->fn = m[i].fn;
+              }
+            }
+            return 0;
+          }
+          static int j_GetJavaVM(void *env, void **vm) { (void)env; *vm = (void *)&g_vmobj; return 0; }
+          static int vm_Destroy(void *vm) { (void)vm; return 0; }
+          static int vm_Attach(void *vm, void **penv, void *args) { (void)vm; (void)args; *penv = (void *)&g_envobj; return 0; }
+          static int vm_GetEnv(void *vm, void **penv, int ver) { static int n; (void)vm; *penv = (void *)&g_envobj; if (n++ < 10) L("[JNI] GetEnv(versi 0x%x)\n", ver); else if (n == 11) L("[JNI] GetEnv: log selanjutnya disembunyikan\n"); return 0; }
+
+          #define SETFAM(base, N) do { g_jni_table[base] = (void *)j_Call##N##Method; g_jni_table[base + 1] = (void *)j_Call##N##MethodV; g_jni_table[base + 2] = (void *)j_Call##N##MethodA; \
+            g_jni_table[base + 80] = (void *)j_CallStatic##N##Method; g_jni_table[base + 81] = (void *)j_CallStatic##N##MethodV; g_jni_table[base + 82] = (void *)j_CallStatic##N##MethodA; } while (0)
+
+          static void init_jni(void) {
+            int i;
+            for (i = 0; i < 256; i++) g_jni_table[i] = jstubs[i];
+            g_jni_table[4] = (void *)j_GetVersion;   g_jni_table[6] = (void *)j_FindClass;
+            g_jni_table[15] = (void *)j_zero1;       g_jni_table[16] = (void *)j_void1;
+            g_jni_table[17] = (void *)j_void1;       g_jni_table[19] = (void *)j_zero2;
+            g_jni_table[20] = (void *)j_ident;       g_jni_table[21] = (void *)j_ident;
+            g_jni_table[22] = (void *)j_void2;       g_jni_table[23] = (void *)j_void2;
+            g_jni_table[25] = (void *)j_ident;       g_jni_table[26] = (void *)j_zero2;
+            g_jni_table[27] = (void *)j_AllocObject; g_jni_table[28] = (void *)j_NewObject;
+            g_jni_table[29] = (void *)j_NewObjectV;  g_jni_table[30] = (void *)j_NewObjectA;
+            g_jni_table[31] = (void *)j_GetObjectClass; g_jni_table[33] = (void *)j_GetMethodID;
+            SETFAM(34, Object); SETFAM(37, Boolean); SETFAM(40, Byte); SETFAM(43, Char); SETFAM(46, Short);
+            SETFAM(49, Int);    SETFAM(52, Long);    SETFAM(55, Float); SETFAM(58, Double); SETFAM(61, Void);
+            g_jni_table[94] = (void *)j_GetFieldID;  g_jni_table[113] = (void *)j_GetStaticMethodID;
+            g_jni_table[144] = (void *)j_GetFieldID;
+            g_jni_table[163] = (void *)j_NewString;  g_jni_table[164] = (void *)j_GetStringLength;
+            g_jni_table[165] = (void *)j_GetStringChars; g_jni_table[166] = (void *)j_ReleaseStringChars;
+            g_jni_table[167] = (void *)j_NewStringUTF; g_jni_table[168] = (void *)j_GetStringUTFLength;
+            g_jni_table[169] = (void *)j_GetStringUTFChars; g_jni_table[170] = (void *)j_ReleaseStringUTFChars;
+            g_jni_table[215] = (void *)j_RegisterNatives; g_jni_table[217] = (void *)j_zero2;
+            g_jni_table[218] = (void *)j_zero2;      g_jni_table[219] = (void *)j_GetJavaVM;
+            g_jni_table[226] = (void *)j_ident;      g_jni_table[227] = (void *)j_void2;
+            g_jni_table[228] = (void *)j_zero1;
+            g_vm_table[3] = (void *)vm_Destroy; g_vm_table[4] = (void *)vm_Attach; g_vm_table[5] = (void *)vm_Destroy;
+            g_vm_table[6] = (void *)vm_GetEnv;  g_vm_table[7] = (void *)vm_Attach;
+          }
+
+          /* ======================= pemuat ELF ======================= */
+          static int read_file(const char *path, uint8_t **buf, size_t *len) {
+            FILE *f = fopen(path, "rb");
+            long n;
+            if (!f) return -1;
+            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            *buf = malloc((size_t)n);
+            if (!*buf || fread(*buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); return -1; }
+            fclose(f); *len = (size_t)n;
+            return 0;
+          }
+
+          static int load_mod(const char *dir, const char *name, Mod **out) {
+            char path[512];
+            Mod *m;
+            const Elf32_Ehdr *eh;
+            const Elf32_Phdr *ph;
+            uint32_t minv = 0xFFFFFFFFu, maxv = 0;
+            int i, dyn_found = 0;
+            if (nmods >= MAXMOD) return -1;
+            m = &mods[nmods];
+            memset(m, 0, sizeof *m);
+            snprintf(m->name, sizeof m->name, "%s", name);
+            snprintf(path, sizeof path, "%s/%s", dir, name);
+            if (read_file(path, &m->file, &m->fsize) != 0) { L("GAGAL membaca %s\n", path); return -1; }
+            eh = (const Elf32_Ehdr *)m->file;
+            if (m->fsize < sizeof *eh || memcmp(eh->e_ident, ELFMAG, SELFMAG) || eh->e_ident[EI_CLASS] != ELFCLASS32 || eh->e_machine != EM_ARM || eh->e_type != ET_DYN) {
+              L("%s: bukan ELF ARM32 shared object\n", name); return -1;
+            }
+            ph = (const Elf32_Phdr *)(m->file + eh->e_phoff);
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              if (ph[i].p_vaddr < minv) minv = ph[i].p_vaddr;
+              if (ph[i].p_vaddr + ph[i].p_memsz > maxv) maxv = ph[i].p_vaddr + ph[i].p_memsz;
+            }
+            minv &= ~(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(PAGE - 1);
+            m->span = maxv - minv;
+            {
+              int fl = MAP_PRIVATE | MAP_ANONYMOUS;
+          #if defined(__x86_64__) && defined(MAP_32BIT)
+              fl |= MAP_32BIT;
+          #endif
+              m->base = mmap(NULL, m->span, PROT_READ | PROT_WRITE, fl, -1, 0);
+            }
+            if (m->base == MAP_FAILED) { L("%s: mmap gagal\n", name); return -1; }
+            m->bias = (uintptr_t)m->base - minv;
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              if ((size_t)ph[i].p_offset + ph[i].p_filesz > m->fsize) { L("%s: segmen melewati ujung file\n", name); return -1; }
+              memcpy((void *)(m->bias + ph[i].p_vaddr), m->file + ph[i].p_offset, ph[i].p_filesz);
+            }
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_DYNAMIC) {
+              const Elf32_Dyn *d = (const Elf32_Dyn *)(m->bias + ph[i].p_vaddr);
+              dyn_found = 1;
+              for (; d->d_tag != DT_NULL; d++) {
+                switch (d->d_tag) {
+                  case DT_SYMTAB: m->sym = (Elf32_Sym *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_STRTAB: m->str = (const char *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_REL: m->rel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_RELSZ: m->nrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
+                  case DT_JMPREL: m->jrel = (Elf32_Rel *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_PLTRELSZ: m->njrel = d->d_un.d_val / sizeof(Elf32_Rel); break;
+                  case DT_INIT: m->init = d->d_un.d_val; break;
+                  case DT_INIT_ARRAY: m->iarr = (uint32_t *)(m->bias + d->d_un.d_ptr); break;
+                  case DT_INIT_ARRAYSZ: m->niarr = d->d_un.d_val / 4; break;
+                  case DT_RELA: case 0x6000000f: case 0x60000011: case DT_RELR:
+                    L("%s: tipe relokasi tidak didukung (tag 0x%x)\n", name, (unsigned)d->d_tag); return -1;
+                  case DT_NEEDED: break;
+                  default: break;
+                }
+              }
+            }
+            if (!dyn_found || !m->sym || !m->str) { L("%s: section dinamis tidak lengkap\n", name); return -1; }
+            /* jumlah simbol dinamis: dari section header (.dynsym) */
+            if (eh->e_shoff && (size_t)eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf32_Shdr) <= m->fsize) {
+              const Elf32_Shdr *sh = (const Elf32_Shdr *)(m->file + eh->e_shoff);
+              for (i = 0; i < eh->e_shnum; i++) if (sh[i].sh_type == SHT_DYNSYM) m->nsym = (int)(sh[i].sh_size / sizeof(Elf32_Sym));
+            }
+            if (m->nsym <= 0) { L("%s: jumlah simbol tidak diketahui\n", name); return -1; }
+            nmods++;
+            *out = m;
+            L("[load] %s: base=%p span=0x%zx bias=0x%lx simbol=%d rel=%u jmprel=%u init_array=%u\n", name, (void *)m->base, m->span, (unsigned long)m->bias, m->nsym, m->nrel, m->njrel, m->niarr);
+            return 0;
+          }
+
+          static void (*g_log_flush)(void);   /* Logger::_flushClients() milik game: kosongkan buffer log game ke __android_log_print */
+          static void *mod_find(const Mod *m, const char *name) {
+            int i;
+            for (i = 1; i < m->nsym; i++) {
+              const Elf32_Sym *s = &m->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(m->str + s->st_name, name) == 0) return (void *)(m->bias + s->st_value);
+            }
+            return NULL;
+          }
+
+          /* ---- cegat log internal game: Logger::_processBuffer(Logger*, int level, char *teks) -> cetak langsung ---- */
+          static int g_glog_n;
+          static void game_log_hook(void *self, int lvl, char *buf) {
+            size_t n;
+            (void)self;
+            if (!buf) return;
+            n = strlen(buf);
+            if (g_glog_n++ < 5000) L("[game:%d] %s%s", lvl, buf, (n && buf[n - 1] == '\n') ? "" : "\n");
+          }
+          static int hook_jump(void *fn, void *to) {
+          #if defined(__arm__)
+            uintptr_t a = (uintptr_t)fn & ~1u, pg = a & ~(uintptr_t)(PAGE - 1);
+            uint32_t *p = (uint32_t *)a;
+            if (((uintptr_t)fn & 1u) || mprotect((void *)pg, 2 * PAGE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return -1;
+            p[0] = 0xe51ff004u;            /* ldr pc, [pc, #-4] */
+            p[1] = (uint32_t)(uintptr_t)to;
+            __builtin___clear_cache((char *)p, (char *)(p + 2));
+            mprotect((void *)pg, 2 * PAGE, PROT_READ | PROT_EXEC);
+            return 0;
+          #else
+            (void)fn; (void)to; return -1;
+          #endif
+          }
+
+          static int fp_suspect(const char *n) {
+            static const char *k[] = { "sinh","cosh","tanh","asinh","acosh","atanh","cbrt","hypot","fmin","fmax","copysign","nearbyint","lround","ceilf","exp2","exp2f","expm1","log1p","hypotf","fminf","fmaxf","copysignf","modf","modff","sinhf","coshf","tanhf","cbrtf","remainder","fdim","scalbn","scalbnf","nextafter","trunc","rintf","nearbyintf","strtold","glColor4f","glTranslatef","glScalef","glRotatef","glOrthof","glFrustumf","glLineWidth","glTexParameterf","glTexEnvf","glAlphaFunc","glPointSize","glFogf","glLightf","glMaterialf","glDepthRangef","glPolygonOffset","glSampleCoverage","glNormal3f","glBlendColor","glClipPlanef","glFogfv","glLightfv","glMaterialfv","glTexEnvfv","glTexParameterfv","glLightModelf","glPointParameterf","difftime", NULL };
+            int i;
+            for (i = 0; k[i]; i++) if (strcmp(k[i], n) == 0) return 1;
+            return 0;
+          }
+          static int cnt_fpwarn;
+
+          static uint32_t resolve(const Mod *self, const Elf32_Sym *s) {
+            const char *n = self->str + s->st_name;
+            int i;
+            void *p;
+            if (s->st_shndx != SHN_UNDEF) { cnt_self++; return U32(self->bias + s->st_value); }
+            for (i = 0; i < nmods; i++) if (&mods[i] != self && (p = mod_find(&mods[i], n))) { cnt_mod++; return U32(p); }
+            for (i = 0; shim[i].name; i++) if (strcmp(shim[i].name, n) == 0) { cnt_shim++; if (nshim_hit < 256) shim_hit[nshim_hit++] = shim[i].name; return U32(shim[i].addr); }
+            if ((p = dlsym(RTLD_DEFAULT, n))) { cnt_libc++; if (fp_suspect(n)) { cnt_fpwarn++; L("[FP-ABI] PERINGATAN: %s memakai float/double tapi belum punya pembungkus softfp!\n", n); } return U32(p); }
+            if (h_gles && (p = dlsym(h_gles, n))) { cnt_gl++; if (fp_suspect(n)) { cnt_fpwarn++; L("[FP-ABI] PERINGATAN: %s memakai float/double tapi belum punya pembungkus softfp!\n", n); } return U32(p); }
+            if (h_egl && (p = dlsym(h_egl, n))) { cnt_gl++; return U32(p); }
+            if (ELF32_ST_BIND(s->st_info) == STB_WEAK) { cnt_weak0++; return 0; }
+            for (i = 0; i < nunres; i++) if (strcmp(unres_name[i], n) == 0) return U32(tstubs[i]);
+            cnt_unres++;
+            if (nunres < MAXUNRES) { unres_name[nunres] = n; return U32(tstubs[nunres++]); }
+            return U32(tstubs[MAXUNRES - 1]);
+          }
+
+          static int relocate(Mod *m) {
+            int pass, bad = 0;
+            unsigned ntype[64] = {0};
+            for (pass = 0; pass < 2; pass++) {
+              Elf32_Rel *r = pass ? m->jrel : m->rel;
+              uint32_t n = pass ? m->njrel : m->nrel, k;
+              for (k = 0; k < n; k++) {
+                uint32_t type = ELF32_R_TYPE(r[k].r_info), si = ELF32_R_SYM(r[k].r_info);
+                uint32_t *where = (uint32_t *)(m->bias + r[k].r_offset);
+                if (type < 64) ntype[type]++;
+                switch (type) {
+                  case R_ARM_NONE: break;
+                  case R_ARM_RELATIVE: *where += U32(m->bias); break;
+                  case R_ARM_ABS32: if (si) *where += resolve(m, &m->sym[si]); break;
+                  case R_ARM_GLOB_DAT: case R_ARM_JUMP_SLOT: *where = resolve(m, &m->sym[si]); break;
+                  default: L("[reloc] %s: tipe tidak didukung %u (offset 0x%x)\n", m->name, type, r[k].r_offset); bad++; break;
+                }
+              }
+            }
+            L("[reloc] %s: RELATIVE=%u ABS32=%u GLOB_DAT=%u JUMP_SLOT=%u tak-didukung=%d\n", m->name, ntype[R_ARM_RELATIVE], ntype[R_ARM_ABS32], ntype[R_ARM_GLOB_DAT], ntype[R_ARM_JUMP_SLOT], bad);
+            return bad;
+          }
+
+          static void protect(Mod *m) {
+            const Elf32_Ehdr *eh = (const Elf32_Ehdr *)m->file;
+            const Elf32_Phdr *ph = (const Elf32_Phdr *)(m->file + eh->e_phoff);
+            size_t np = m->span / PAGE, p;
+            unsigned char *fl = calloc(np, 1);
+            int i;
+            __builtin___clear_cache((char *)m->base, (char *)m->base + m->span);
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              uintptr_t a = (m->bias + ph[i].p_vaddr) & ~(uintptr_t)(PAGE - 1);
+              uintptr_t e = (m->bias + ph[i].p_vaddr + ph[i].p_memsz + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+              unsigned pr = ((ph[i].p_flags & PF_R) ? PROT_READ : 0) | ((ph[i].p_flags & PF_W) ? PROT_WRITE : 0) | ((ph[i].p_flags & PF_X) ? PROT_EXEC : 0);
+              for (; a < e; a += PAGE) fl[(a - (uintptr_t)m->base) / PAGE] |= (unsigned char)pr;
+            }
+            for (p = 0; p < np; ) {
+              size_t q = p + 1;
+              while (q < np && fl[q] == fl[p]) q++;
+              if (fl[p] && mprotect(m->base + p * PAGE, (q - p) * PAGE, fl[p]) != 0) L("[protect] %s: mprotect gagal: %s\n", m->name, strerror(errno));
+              p = q;
+            }
+            free(fl);
+          }
+
+          static void run_init(Mod *m) {
+            uint32_t i;
+            if (m->init) { L("[init] %s: DT_INIT di 0x%x\n", m->name, m->init); ((void (*)(void))(m->bias + m->init))(); }
+            for (i = 0; i < m->niarr; i++) {
+              uint32_t f = m->iarr[i];
+              if (f == 0 || f == 0xFFFFFFFFu) continue;
+              L("[init] %s: init_array[%u] = %p\n", m->name, i, (void *)(uintptr_t)f);
+              ((void (*)(void))(uintptr_t)f)();
+            }
+            L("[init] %s: selesai\n", m->name);
+          }
+
+          static int pint(const char *s) { int v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return v; }
+          static void on_alarm(int sig) { (void)sig; L("\n*** WATCHDOG: waktu habis, proses dihentikan ***\n"); _exit(4); }
+
+          int main(int argc, char **argv) {
+            const char *dir = "libs";
+            int dry = 0, i, stage = 2, timeout = 120;
+            Mod *mono = NULL, *un = NULL;
+            struct sigaction sa;
+            struct utsname u;
+            char cwd[400], apk_abs[1024];
+
+            snprintf(g_apk, sizeof g_apk, "cordy.apk");
+            for (i = 1; i < argc; i++) {
+              if (!strcmp(argv[i], "--dry")) dry = 1;
+              else if (!strcmp(argv[i], "--apk") && i + 1 < argc) snprintf(g_apk, sizeof g_apk, "%s", argv[++i]);
+              else if (!strcmp(argv[i], "--stage") && i + 1 < argc) stage = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
+              else if (argv[i][0] != '-') dir = argv[i];
+            }
+            g_log = fopen("loader_log.txt", "w");
+            L("== cordyloader (Milestone 2: muat libmono+libunity, JNI_OnLoad) ==\n");
+            if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
+          #if !defined(__arm__)
+            dry = 1;
+            L("(bukan ARM: mode --dry dipaksa)\n");
+          #endif
+            L("libs: %s | apk: %s | mode: %s | stage=%d timeout=%ds\n", dir, g_apk, dry ? "DRY" : "JALAN", stage, timeout);
+
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = on_sig; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+            { stack_t ss0; ss0.ss_sp = malloc(1u << 17); ss0.ss_size = 1u << 17; ss0.ss_flags = 0; if (ss0.ss_sp) sigaltstack(&ss0, NULL); }
+            sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+            sigaction(SIGFPE, &sa, NULL);  sigaction(SIGABRT, &sa, NULL);
+            signal(SIGALRM, on_alarm);
+
+            init_tables();
+            init_jni();
+
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libstdc++.so.6", RTLD_NOW | RTLD_GLOBAL);
+            h_gles = dlopen("/usr/lib32/libGLESv1_CM.so.1", RTLD_LAZY | RTLD_LOCAL);
+            h_egl = dlopen("/usr/lib32/libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+            L("GLESv1_CM: %s | EGL: %s\n", h_gles ? "OK" : "TIDAK ADA", h_egl ? "OK" : "TIDAK ADA");
+
+            /* libmono dulu: libunity mengimpor 121 simbol darinya */
+            if (load_mod(dir, "libmono.so", &mono) != 0) return 1;
+            if (relocate(mono) != 0) return 1;
+            protect(mono);
+            if (load_mod(dir, "libunity.so", &un) != 0) return 1;
+            if (relocate(un) != 0) return 1;
+            protect(un);
+
+            L("\n== ringkasan resolusi simbol ==\n");
+            L("modul sendiri=%d | modul lain (libmono)=%d | shim=%d | glibc/libstdc++=%d | GL/EGL=%d | weak->0=%d | TAK TERSELESAIKAN=%d | peringatan FP-ABI=%d\n",
+              cnt_self, cnt_mod, cnt_shim, cnt_libc, cnt_gl, cnt_weak0, cnt_unres, cnt_fpwarn);
+            for (i = 0; i < nunres; i++) L("  TAK TERSELESAIKAN: %s\n", unres_name[i]);
+            { int k; L("\n== ekspor JNI libunity ==\n");
+              for (k = 1; k < un->nsym; k++) { const Elf32_Sym *s = &un->sym[k]; if (s->st_shndx != SHN_UNDEF && s->st_name && (!strncmp(un->str + s->st_name, "Java_", 5) || !strcmp(un->str + s->st_name, "JNI_OnLoad"))) L("[export] %s\n", un->str + s->st_name); } }
+
+            if (dry) { L("\n== DRY selesai (tidak ada kode game yang dijalankan) ==\n"); return 0; }
+            if (timeout > 0) alarm((unsigned)timeout);
+
+            L("\n== konstruktor ==\n");
+            run_init(mono);
+            run_init(un);
+
+            L("\n== JNI_OnLoad ==\n");
+            {
+              void *mfn = mod_find(mono, "JNI_OnLoad");
+              void *fn = mod_find(un, "JNI_OnLoad");
+              if (mfn) L("libmono JNI_OnLoad -> 0x%x\n", ((int (*)(void *, void *))mfn)((void *)&g_vmobj, NULL));
+              if (!fn) { L("libunity: JNI_OnLoad tidak ada\n"); return 1; }
+              L("libunity JNI_OnLoad -> 0x%x\n", ((int (*)(void *, void *))fn)((void *)&g_vmobj, NULL));
+            }
+            L("\n== tabel native terdaftar: %d metode ==\n", g_nnat);
+            for (i = 0; i < g_nnat; i++) L("[native] %s.%s %s -> %p\n", g_nat[i].cls, g_nat[i].name, g_nat[i].sig, g_nat[i].fn);
+
+            if (stage >= 3) {
+              void *env = (void *)&g_envobj;
+              void *obj = mk_obj("com/unity3d/player/UnityPlayer");
+              void *f_file = nat_find("nativeFile");
+              char *rp;
+              if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+              rp = realpath(g_apk, NULL);
+              if (rp) { snprintf(apk_abs, sizeof apk_abs, "%s", rp); free(rp); } else snprintf(apk_abs, sizeof apk_abs, "%s/%s", cwd, g_apk);
+              L("\n== nativeFile(\"%s\") ==\n", apk_abs);
+              if (f_file && !strcmp(nat_sig("nativeFile"), "(Ljava/lang/String;)V")) {
+                ((void (*)(void *, void *, void *))f_file)(env, obj, mk_handle("string", apk_abs));
+                L("nativeFile selesai\n");
+              } else L("nativeFile tidak ada / signature beda (%s) -> dilewati\n", nat_sig("nativeFile"));
+            }
+
+            L("\n== ringkasan panggilan Java (jumlah) ==\n");
+            for (i = 0; i < nminfo; i++) if (minfo[i].count) L("  %5u  %s.%s%s\n", minfo[i].count, minfo[i].cls, minfo[i].name, minfo[i].sig);
+            L("\n== Milestone 2 selesai ==\n");
+            return 0;
+          }
+          EOF_C2
+          cat > src/gen_stubs.py <<'EOF_PY'
+          # Menghasilkan stubs.inc: nama slot JNI + 256 stub JNI + 64 stub simbol-tak-terselesaikan
+          types = ["Object","Boolean","Byte","Char","Short","Int","Long","Float","Double","Void"]
+          prims = ["Boolean","Byte","Char","Short","Int","Long","Float","Double"]
+          n = {}
+          for i in range(4): n[i] = "reserved%d" % i
+          n[4]="GetVersion"; n[5]="DefineClass"; n[6]="FindClass"; n[7]="FromReflectedMethod"; n[8]="FromReflectedField"
+          n[9]="ToReflectedMethod"; n[10]="GetSuperclass"; n[11]="IsAssignableFrom"; n[12]="ToReflectedField"
+          n[13]="Throw"; n[14]="ThrowNew"; n[15]="ExceptionOccurred"; n[16]="ExceptionDescribe"; n[17]="ExceptionClear"
+          n[18]="FatalError"; n[19]="PushLocalFrame"; n[20]="PopLocalFrame"; n[21]="NewGlobalRef"; n[22]="DeleteGlobalRef"
+          n[23]="DeleteLocalRef"; n[24]="IsSameObject"; n[25]="NewLocalRef"; n[26]="EnsureLocalCapacity"
+          n[27]="AllocObject"; n[28]="NewObject"; n[29]="NewObjectV"; n[30]="NewObjectA"
+          n[31]="GetObjectClass"; n[32]="IsInstanceOf"; n[33]="GetMethodID"
+          i = 34
+          for t in types:
+              for s in ("", "V", "A"): n[i] = "Call%sMethod%s" % (t, s); i += 1
+          for t in types:
+              for s in ("", "V", "A"): n[i] = "CallNonvirtual%sMethod%s" % (t, s); i += 1
+          assert i == 94
+          n[94]="GetFieldID"; i = 95
+          for t in types[:9]: n[i] = "Get%sField" % t; i += 1
+          for t in types[:9]: n[i] = "Set%sField" % t; i += 1
+          assert i == 113
+          n[113]="GetStaticMethodID"; i = 114
+          for t in types:
+              for s in ("", "V", "A"): n[i] = "CallStatic%sMethod%s" % (t, s); i += 1
+          assert i == 144
+          n[144]="GetStaticFieldID"; i = 145
+          for t in types[:9]: n[i] = "GetStatic%sField" % t; i += 1
+          for t in types[:9]: n[i] = "SetStatic%sField" % t; i += 1
+          assert i == 163
+          for k, nm in enumerate(["NewString","GetStringLength","GetStringChars","ReleaseStringChars","NewStringUTF",
+                                  "GetStringUTFLength","GetStringUTFChars","ReleaseStringUTFChars","GetArrayLength",
+                                  "NewObjectArray","GetObjectArrayElement","SetObjectArrayElement"]):
+              n[163 + k] = nm
+          i = 175
+          for t in prims: n[i] = "New%sArray" % t; i += 1
+          for t in prims: n[i] = "Get%sArrayElements" % t; i += 1
+          for t in prims: n[i] = "Release%sArrayElements" % t; i += 1
+          for t in prims: n[i] = "Get%sArrayRegion" % t; i += 1
+          for t in prims: n[i] = "Set%sArrayRegion" % t; i += 1
+          assert i == 215
+          for k, nm in enumerate(["RegisterNatives","UnregisterNatives","MonitorEnter","MonitorExit","GetJavaVM",
+                                  "GetStringRegion","GetStringUTFRegion","GetPrimitiveArrayCritical",
+                                  "ReleasePrimitiveArrayCritical","GetStringCritical","ReleaseStringCritical",
+                                  "NewWeakGlobalRef","DeleteWeakGlobalRef","ExceptionCheck","NewDirectByteBuffer",
+                                  "GetDirectBufferAddress","GetDirectBufferCapacity","GetObjectRefType"]):
+              n[215 + k] = nm
+          assert n[215]=="RegisterNatives" and n[228]=="ExceptionCheck" and n[232]=="GetObjectRefType"
+          assert n[33]=="GetMethodID" and n[113]=="GetStaticMethodID" and n[169]=="GetStringUTFChars" and n[167]=="NewStringUTF"
+          assert n[61]=="CallVoidMethod" and n[141]=="CallStaticVoidMethod" and n[129]=="CallStaticIntMethod"
+          o = []
+          o.append("static const char *const jni_names[256] = {")
+          for k in range(256):
+              o.append('  "%s",' % n.get(k, "slot%d" % k))
+          o.append("};")
+          for k in range(256):
+              o.append("static int jstub_%d(void) { return jni_trap(%d); }" % (k, k))
+          o.append("static void *const jstubs[256] = {")
+          o.append("  " + ", ".join("(void *)jstub_%d" % k for k in range(256)))
+          o.append("};")
+          for k in range(64):
+              o.append("static int tstub_%d(void) { return trap_unres(%d); }" % (k, k))
+          o.append("static void *const tstubs[64] = {")
+          o.append("  " + ", ".join("(void *)tstub_%d" % k for k in range(64)))
+          o.append("};")
+          open("stubs.inc", "w").write("\n".join(o) + "\n")
+          print("stubs.inc ok, nama terisi:", len(n))
+          EOF_PY
+          cat > src/launcher.tpl <<'EOF_TPL'
+          #!/bin/bash
+          # Cordy Android loader (Milestone 2). MODE: @MODE@
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
+            controlfolder="$XDG_DATA_HOME/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/cordy_android"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/cordy_android"
+
+          cd "$GAMEDIR" || {
+            echo "folder cordy_android tidak ketemu: /$directory/ports/cordy_android" > "$(dirname "$0")/loader_error.txt"
+            exit 1
+          }
+
+          export LD_LIBRARY_PATH="/usr/lib32:/lib32:${LD_LIBRARY_PATH}"
+          chmod +x ./cordyloader 2>/dev/null
+
+          echo "GAMEDIR=$GAMEDIR  mode=@MODE@" > loader_stdout.txt
+          if [ ! -f libs/libmono.so ] || [ ! -f libs/libunity.so ] || [ ! -f ./cordyloader ]; then
+            echo "libs/libmono.so, libs/libunity.so atau cordyloader belum ada di $GAMEDIR" >> loader_stdout.txt
+            sleep 3
+            exit 1
+          fi
+          ls -l libs/libmono.so libs/libunity.so >> loader_stdout.txt 2>&1
+          [ -f cordy.apk ] || echo "PERINGATAN: cordy.apk tidak ada di $GAMEDIR (salin APK Cordy dan namai cordy.apk)" >> loader_stdout.txt
+
+          rm -f loader_log.txt
+          LOADER_ARGS="$(cat loader.args 2>/dev/null)"
+          ./cordyloader libs @ARG@ $LOADER_ARGS >> loader_stdout.txt 2>&1
+          echo "exit code: $?" >> loader_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_TPL
+          echo "--apk cordy.apk --stage 3 --timeout 120" > out/cordy_android/loader.args
+          echo "Taruh libmono.so dan libunity.so (yang BESAR, dari assets/libs/armeabi-v7a di APK) di folder ini. Jangan di-upload ke GitHub." > out/cordy_android/libs/TARUH-LIB-DI-SINI.txt
+
+      - name: Buat stub JNI dan skrip peluncur
+        run: |
+          cd src && python3 gen_stubs.py && cd ..
+          sed -e 's/@MODE@/JALAN/' -e 's/@ARG@//' src/launcher.tpl > out/CordyLoader.sh
+          sed -e 's/@MODE@/DRY/' -e 's/@ARG@/--dry/' src/launcher.tpl > out/CordyLoader_dry.sh
+          bash -n out/CordyLoader.sh
+          bash -n out/CordyLoader_dry.sh
+
+      - name: Kompilasi (armhf)
+        run: |
+          arm-linux-gnueabihf-gcc -O2 -Wall -Wno-missing-field-initializers -Isrc -o out/cordy_android/cordyloader src/cordyloader.c -ldl -lpthread -lm
+          file out/cordy_android/cordyloader || true
+          MAXV=$(arm-linux-gnueabihf-readelf -V out/cordy_android/cordyloader | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "cordyloader butuh GLIBC tertinggi: $MAXV (device: 2.37)"
+          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+            echo "GAGAL: butuh glibc lebih baru dari 2.37. Simbol penyebab:"
+            arm-linux-gnueabihf-nm -D --undefined-only out/cordy_android/cordyloader | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
+            exit 1
+          fi
+
+      - name: Unggah hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordy-m2-armhf
+          path: out
