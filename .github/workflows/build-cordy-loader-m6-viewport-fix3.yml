@@ -1,4 +1,4 @@
-name: build-cordy-loader-m6-perf-fix7
+name: build-cordy-loader-m6-prof-fix8
 on:
   workflow_dispatch:
   push:
@@ -2168,6 +2168,74 @@ jobs:
             L("[audio] berhenti (underrun total=%u)\n", au_underruns);
           }
 
+          /* ======================= profiler sampling PC (diagnosa performa) =======================
+           * ITIMER_PROF 100 Hz: hanya menghitung waktu CPU. Tiap 120 frame dicetak fungsi yang paling sering sedang berjalan.
+           * "anon(JIT/lain)" = kode Mono JIT (memori anonim). Matikan dengan env CORDY_NOPROF=1. */
+          #include <sys/time.h>
+          #define PS_MAX 4096
+          static uintptr_t ps_buf[PS_MAX], ps_cp[PS_MAX];
+          static volatile int ps_n;
+          static int ps_on;
+          static void on_prof(int sig, siginfo_t *si, void *ucp) {
+            (void)sig; (void)si;
+          #if defined(__arm__)
+            if (ps_n < PS_MAX) ps_buf[ps_n++] = ((ucontext_t *)ucp)->uc_mcontext.arm_pc;
+          #else
+            (void)ucp;
+          #endif
+          }
+          static void prof_start(void) {
+            struct sigaction sa; struct itimerval it;
+            if (getenv("CORDY_NOPROF")) return;
+            memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_prof; sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK; sigemptyset(&sa.sa_mask);
+            sigaction(SIGPROF, &sa, NULL);
+            it.it_interval.tv_sec = 0; it.it_interval.tv_usec = 10000; it.it_value = it.it_interval;
+            setitimer(ITIMER_PROF, &it, NULL); ps_on = 1;
+            L("[prof] sampling PC 100 Hz aktif (matikan: CORDY_NOPROF=1)\n");
+          }
+          static void prof_name(uintptr_t pc, char *out, size_t n) {
+            char d[220]; Dl_info di;
+            describe(pc, d, sizeof d);
+            if (d[0] != '?') {
+              char *plus = strchr(d, '+'), *lp = strchr(d, '(');
+              if (plus) *plus = 0;
+              if (lp) { char *q = strrchr(lp, '+'); if (q) *q = 0; snprintf(out, n, "%s:%s", d, lp + 1); }
+              else snprintf(out, n, "%s:?", d);
+              return;
+            }
+            if (dladdr((void *)pc, &di) && di.dli_fname) {
+              const char *b = strrchr(di.dli_fname, '/');
+              snprintf(out, n, "%s:%s", b ? b + 1 : di.dli_fname, di.dli_sname ? di.dli_sname : "?");
+            } else snprintf(out, n, "anon(JIT/lain)");
+          }
+          static void rd1(const char *p, char *o, size_t n) {
+            FILE *f = fopen(p, "r"); size_t l; o[0] = 0;
+            if (f) { if (fgets(o, (int)n, f)) { l = strlen(o); while (l && (o[l - 1] == '\n' || o[l - 1] == '\r')) o[--l] = 0; } fclose(f); }
+          }
+          static void prof_report(double el_ms) {
+            static char nm[256][96]; static int ct[256];
+            int n, nn = 0, i, j, step, used = 0, top; sigset_t b, o; char gov[48], fq[48];
+            if (!ps_on) return;
+            sigemptyset(&b); sigaddset(&b, SIGPROF); sigprocmask(SIG_BLOCK, &b, &o);
+            n = ps_n; if (n > PS_MAX) n = PS_MAX; memcpy(ps_cp, ps_buf, (size_t)n * sizeof(uintptr_t)); ps_n = 0; sigprocmask(SIG_SETMASK, &o, NULL);
+            rd1("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", gov, sizeof gov);
+            rd1("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", fq, sizeof fq);
+            L("[prof] CPU terpakai ~%.2f inti (%d sampel / %.0f ms) | governor=%s freq=%s kHz\n", n * 10.0 / (el_ms > 1 ? el_ms : 1), n, el_ms, gov[0] ? gov : "?", fq[0] ? fq : "?");
+            step = n > 400 ? n / 400 : 1;
+            for (i = 0; i < n; i += step) {
+              char t[96];
+              prof_name(ps_cp[i], t, sizeof t); used++;
+              for (j = 0; j < nn; j++) if (!strcmp(nm[j], t)) { ct[j]++; break; }
+              if (j == nn && nn < 256) { snprintf(nm[nn], sizeof nm[nn], "%s", t); ct[nn] = 1; nn++; }
+            }
+            for (top = 0; top < 8 && top < nn; top++) {
+              int best = top;
+              for (j = top + 1; j < nn; j++) if (ct[j] > ct[best]) best = j;
+              if (best != top) { char tn[96]; int tc = ct[top]; memcpy(tn, nm[top], sizeof tn); memcpy(nm[top], nm[best], sizeof tn); ct[top] = ct[best]; memcpy(nm[best], tn, sizeof tn); ct[best] = tc; }
+              L("[prof]   %4.1f%%  %s\n", used ? 100.0 * ct[top] / used : 0.0, nm[top]);
+            }
+          }
+
           static void run_stage3(const char *apk, int na, int nb, int frames) {
             int w = 640, h = 480, f, quit = 0, nerr = 0, r = 0;
             char libdir[480], files[480], cache[480];
@@ -2216,6 +2284,7 @@ jobs:
             if (f_resume) ((fn_v_t)f_resume)(env, obj);
             if (f_focus) ((fn_i_t)f_focus)(env, obj, 1);
             L("init selesai, masuk loop nativeRender (frames=%d, 0=tak terbatas)\n", frames);
+            prof_start();
 
             for (f = 0; !quit && (frames <= 0 || f < frames); f++) {
             unsigned char ev[64]; unsigned err; struct timespec q0, q1, q2, q3;
@@ -2238,7 +2307,7 @@ jobs:
               ta += (q2.tv_sec - q1.tv_sec) * 1e3 + (q2.tv_nsec - q1.tv_nsec) / 1e6;
               ts += (q3.tv_sec - q2.tv_sec) * 1e3 + (q3.tv_nsec - q2.tv_nsec) / 1e6;
               if (++tn == 120) { double el = (q3.tv_sec - tw.tv_sec) * 1e3 + (q3.tv_nsec - tw.tv_nsec) / 1e6;
-                if (tw.tv_sec) L("[fps] %.1f fps | nativeRender %.1f ms | audio+pad %.1f ms | swap %.1f ms (rata-rata/frame)\n", 120000.0 / el, tr / 120, ta / 120, ts / 120);
+                if (tw.tv_sec) { L("[fps] %.1f fps | nativeRender %.1f ms | audio+pad %.1f ms | swap %.1f ms (rata-rata/frame)\n", 120000.0 / el, tr / 120, ta / 120, ts / 120); prof_report(el); }
                 tw = q3; tn = 0; tr = ta = ts = 0; }
               if (!tw.tv_sec) tw = q3; }
             err = p_glGetError ? p_glGetError() : 0;
