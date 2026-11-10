@@ -1,4 +1,4 @@
-name: build-armhf-cordy-loader
+name: build-cordy-loader-m6-audio-fix2
 on:
   workflow_dispatch:
   push:
@@ -96,6 +96,7 @@ jobs:
 
           static void *h_gl1, *h_gl2, *h_mali, *h_egl;
 
+          static void describe(uintptr_t a, char *out, size_t n);
           static void *mod_find(const Mod *m, const char *name) {
             int i;
             for (i = 1; i < m->nsym; i++) {
@@ -215,15 +216,22 @@ jobs:
               upper_tab[c + 1] = (short)((c >= 'a' && c <= 'z') ? c - 32 : c);
             }
             p_ctype = ctype_tab; p_tolower = lower_tab; p_toupper = upper_tab;
+            {
+              static const int16_t fl[3] = { 0x0004, 0x0009, 0x000a };   /* __SRD ; __SWR|__SLBF ; __SWR|__SNBF */
+              for (c = 0; c < 3; c++) { int16_t *h = (int16_t *)(bionic_sF + c * 84); h[6] = fl[c]; h[7] = (int16_t)c; }   /* _flags@12 _file@14 */
+            }
           }
 
           static int *b_errno(void) { return __errno_location(); }
           static int *b_get_h_errno(void) { return __h_errno_location(); }
           static void b_cxa_finalize(void *d) { (void)d; }
           static int b_atexit(void (*fn)(void)) { (void)fn; return 0; }
+          /* Sinyal real-time: bionic ARM memakai 32 dan 33 (SIGRTMIN=32; Mono memakai 32 sebagai sinyal abort-thread). glibc MENCADANGKAN 32/33
+           * untuk NPTL (SIGCANCEL/SIGSETXID) sehingga sigaction(32) = EINVAL -> "Assertion at mini-posix.c:381". Petakan 32->SIGRTMIN, 33->SIGRTMIN+1. */
+          static int msig(int s) { return s == 32 ? SIGRTMIN : s == 33 ? SIGRTMIN + 1 : s; }
           static int b_gettid(void) { return (int)syscall(SYS_gettid); }
-          static int b_tkill(int tid, int sig) { return (int)syscall(SYS_tkill, tid, sig); }
-          static void *b_bsd_signal(int sig, void *h) { return (void *)signal(sig, (void (*)(int))h); }
+          static int b_tkill(int tid, int sig) { return (int)syscall(SYS_tkill, tid, sig ? msig(sig) : 0); }
+          static void *b_bsd_signal(int sig, void *h) { return (void *)signal(msig(sig), (void (*)(int))h); }
           static size_t b_strlcpy(char *d, const char *s, size_t n) {
             size_t l = strlen(s);
             if (n) { size_t c = l >= n ? n - 1 : l; memcpy(d, s, c); d[c] = 0; }
@@ -267,6 +275,26 @@ jobs:
           static int b_ferror(void *f) { return ferror(mf(f)); }
           static void b_clearerr(void *f) { clearerr(mf(f)); }
           static int b_fclose(void *f) { FILE *r = mf(f); return (r == stdin || r == stdout || r == stderr) ? 0 : fclose(r); }
+
+          /* Mono JIT (mini-arm.c) membaca /proc/cpuinfo: butuh "Processor ... (v7" dan "Features ... thumb". Kernel aarch64 menampilkan
+           * format 64-bit (tanpa "thumb") -> assert `thumb_supported' gagal. Hanya untuk pemanggil dari libmono kita sajikan cpuinfo ARMv7 palsu
+           * (tanpa "neon" agar jalur kode Unity tidak berubah); pemanggil lain tetap membaca file asli. */
+          __attribute__((noinline)) static FILE *b_fopen(const char *p, const char *m) {
+            static const char ci[] =
+              "Processor\t: ARMv7 Processor rev 4 (v7l)\nBogoMIPS\t: 48.00\n"
+              "Features\t: swp half thumb fastmult vfp edsp vfpv3 tls\n"
+              "CPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x0\nCPU part\t: 0xd03\nCPU revision\t: 4\n\n"
+              "Hardware\t: Generic\nRevision\t: 0000\nSerial\t\t: 0000000000000000\n";
+            if (p && !strcmp(p, "/proc/cpuinfo")) {
+              uintptr_t ra = (uintptr_t)__builtin_return_address(0); int k;
+              for (k = 0; k < nmods; k++)
+                if (strstr(mods[k].name, "libmono") && ra >= (uintptr_t)mods[k].base && ra < (uintptr_t)mods[k].base + mods[k].span) {
+                  FILE *f = fmemopen((void *)ci, sizeof ci - 1, "r");
+                  if (f) { L("[cpuinfo] libmono membuka /proc/cpuinfo -> cpuinfo ARMv7 palsu\n"); return f; }
+                }
+            }
+            return fopen(p, m);
+          }
           static int b_fseek(void *f, long o, int w) { return fseek(mf(f), o, w); }
           static long b_ftell(void *f) { return ftell(mf(f)); }
           static int b_fileno(void *f) { return fileno(mf(f)); }
@@ -274,9 +302,16 @@ jobs:
           static int b_fsetpos(void *f, const long *pos) { return fseek(mf(f), *pos, SEEK_SET); }
 
           /* --- stat/dirent: layout bionic ARM32 = stat64/dirent64 kernel --- */
-          static int b_stat(const char *p, void *b) { return stat64(p, (struct stat64 *)b); }
-          static int b_fstat(int fd, void *b) { return fstat64(fd, (struct stat64 *)b); }
-          static int b_lstat(const char *p, void *b) { return lstat64(p, (struct stat64 *)b); }
+          #ifndef SYS_stat64
+          #define SYS_stat64 195
+          #define SYS_lstat64 196
+          #define SYS_fstat64 197
+          #endif
+          /* PENTING: header glibc baru di CI bisa memakai struct stat64 versi time64 (>104 byte) -> menimpa buffer bionic 104 byte.
+           * Syscall mentah mengisi persis layout kernel ARM EABI stat64 = struct stat bionic. */
+          static int b_stat(const char *p, void *b) { return (int)syscall(SYS_stat64, p, b); }
+          static int b_fstat(int fd, void *b) { return (int)syscall(SYS_fstat64, fd, b); }
+          static int b_lstat(const char *p, void *b) { return (int)syscall(SYS_lstat64, p, b); }
 
           /* --- sysconf: nilai _SC_* bionic berbeda dari glibc (VERIFIKASI bila ada perilaku aneh) --- */
           static long b_sysconf(int n) {
@@ -284,7 +319,7 @@ jobs:
               case 0x00: return sysconf(_SC_ARG_MAX);
               case 0x06: return sysconf(_SC_CLK_TCK);
               case 0x0b: return sysconf(_SC_OPEN_MAX);
-              case 0x27: return sysconf(_SC_PAGESIZE);
+              case 0x27: case 0x28: return sysconf(_SC_PAGESIZE);
               case 0x60: return sysconf(_SC_NPROCESSORS_CONF);
               case 0x61: return sysconf(_SC_NPROCESSORS_ONLN);
               case 0x62: return sysconf(_SC_PHYS_PAGES);
@@ -417,7 +452,11 @@ jobs:
             *slot = 0; return 0;
           }
           static int b_cond_wait(uint32_t *c, uint32_t *m) { return pthread_cond_wait(cv_get(c), mx_get(m)); }
-          static int b_cond_timedwait(uint32_t *c, uint32_t *m, const struct timespec *t) { return pthread_cond_timedwait(cv_get(c), mx_get(m), t); }
+          static int b_cond_timedwait(uint32_t *c, uint32_t *m, const void *t) {
+            static int (*f)(pthread_cond_t *, pthread_mutex_t *, const void *);   /* simbol default glibc = timespec 32-bit */
+            if (!f) *(void **)&f = dlsym(RTLD_DEFAULT, "pthread_cond_timedwait");
+            return f(cv_get(c), mx_get(m), t);
+          }
           static int b_cond_signal(uint32_t *c) { return pthread_cond_signal(cv_get(c)); }
           static int b_cond_broadcast(uint32_t *c) { return pthread_cond_broadcast(cv_get(c)); }
 
@@ -431,7 +470,13 @@ jobs:
           static int b_sem_wait(uint32_t *slot) { sem_t *s = sm_get(slot); if (!s) { errno = EINVAL; return -1; } return sem_wait(s); }
           static int b_sem_trywait(uint32_t *slot) { sem_t *s = sm_get(slot); if (!s) { errno = EINVAL; return -1; } return sem_trywait(s); }
           static int b_sem_post(uint32_t *slot) { sem_t *s = sm_get(slot); if (!s) { errno = EINVAL; return -1; } return sem_post(s); }
-          static int b_sem_timedwait(uint32_t *slot, const struct timespec *t) { sem_t *s = sm_get(slot); if (!s) { errno = EINVAL; return -1; } return sem_timedwait(s, t); }
+          static int b_sem_timedwait(uint32_t *slot, const void *t) {
+            static int (*f)(sem_t *, const void *);
+            sem_t *s = sm_get(slot);
+            if (!s) { errno = EINVAL; return -1; }
+            if (!f) *(void **)&f = dlsym(RTLD_DEFAULT, "sem_timedwait");
+            return f(s, t);
+          }
           static int b_sem_getvalue(uint32_t *slot, int *v) { sem_t *s = sm_get(slot); if (!s) { errno = EINVAL; return -1; } return sem_getvalue(s, v); }
 
           /* pthread_attr_t bionic: {flags, stack_base, stack_size, guard_size, sched_policy, sched_priority} */
@@ -463,20 +508,33 @@ jobs:
             r = pthread_create(t, &ga, fn, arg); pthread_attr_destroy(&ga); return r;
           }
 
-          /* ======================= shim sinyal: sigset_t bionic = 32 bit; struct sigaction beda ======================= */
+          /* ======================= shim sinyal: sigset_t bionic = 32 bit; struct sigaction beda; sinyal RT 32/33 dipetakan ======================= */
           typedef struct { void *handler; uint32_t mask; int flags; void *restorer; } BSA;
-          static void bs2gs(const uint32_t *b, sigset_t *g) { int i; sigemptyset(g); if (!b) return; for (i = 1; i <= 31; i++) if (*b & (1u << (i - 1))) sigaddset(g, i); }
-          static void gs2bs(const sigset_t *g, uint32_t *b) { int i; *b = 0; for (i = 1; i <= 31; i++) if (sigismember(g, i) == 1) *b |= 1u << (i - 1); }
+          static void bs2gs(const uint32_t *b, sigset_t *g) { int i; sigemptyset(g); if (!b) return; for (i = 1; i <= 32; i++) if (*b & (1u << (i - 1))) sigaddset(g, msig(i)); }
+          static void gs2bs(const sigset_t *g, uint32_t *b) { int i; *b = 0; for (i = 1; i <= 32; i++) if (sigismember(g, msig(i)) == 1) *b |= 1u << (i - 1); }
+          /* handler game untuk sinyal 32: game mengharapkan nomor bionic (32) di argumen pertama, bukan nomor glibc hasil pemetaan */
+          static BSA g_rt32;
+          static void rt32_tramp(int s, siginfo_t *si, void *uc) {
+            (void)s;
+            if (!g_rt32.handler) return;
+            if (g_rt32.flags & SA_SIGINFO) ((void (*)(int, siginfo_t *, void *))g_rt32.handler)(32, si, uc);
+            else ((void (*)(int))g_rt32.handler)(32);
+          }
           static int b_sigaction(int sig, const BSA *act, BSA *old) {
-            struct sigaction a, o; int r;
+            struct sigaction a, o; int r, gs = msig(sig);
             memset(&a, 0, sizeof a); memset(&o, 0, sizeof o);
             if (act) {
               a.sa_sigaction = (void (*)(int, siginfo_t *, void *))act->handler; bs2gs(&act->mask, &a.sa_mask);
               a.sa_flags = act->flags & ~0x04000000;   /* buang SA_RESTORER: restorer glibc dipasang sendiri */
-              L("[sig] game memasang handler sinyal %d: %p flags=0x%x\n", sig, act->handler, (unsigned)act->flags);
+              if (sig == 32 && (uintptr_t)act->handler > 1u) { g_rt32 = *act; a.sa_sigaction = rt32_tramp; a.sa_flags |= SA_SIGINFO; }
+              L("[sig] game memasang handler sinyal %d%s: %p flags=0x%x\n", sig, gs != sig ? " (dipetakan ke sinyal glibc lain)" : "", act->handler, (unsigned)act->flags);
             }
-            r = sigaction(sig, act ? &a : NULL, old ? &o : NULL);
-            if (old && r == 0) { old->handler = (void *)o.sa_sigaction; gs2bs(&o.sa_mask, &old->mask); old->flags = o.sa_flags; old->restorer = NULL; }
+            r = sigaction(gs, act ? &a : NULL, old ? &o : NULL);
+            if (r != 0) L("[sig] sigaction(%d -> %d) GAGAL: errno=%d (%s)\n", sig, gs, errno, strerror(errno));
+            if (old && r == 0) {
+              old->handler = (sig == 32 && (uintptr_t)o.sa_sigaction == (uintptr_t)rt32_tramp) ? g_rt32.handler : (void *)o.sa_sigaction;
+              gs2bs(&o.sa_mask, &old->mask); old->flags = o.sa_flags; old->restorer = NULL;
+            }
             return r;
           }
           static int b_sigprocmask(int how, const uint32_t *s, uint32_t *o) {
@@ -493,6 +551,9 @@ jobs:
             if (o && r == 0) gs2bs(&go, o);
             return r;
           }
+          static int b_pthread_kill(pthread_t t, int sig) { return pthread_kill(t, sig ? msig(sig) : 0); }
+          static int b_kill(int pid, int sig) { return kill(pid, sig ? msig(sig) : 0); }
+          static int b_raise(int sig) { return raise(msig(sig)); }
           static int b_sigsuspend(const uint32_t *m) { sigset_t gs; bs2gs(m, &gs); return sigsuspend(&gs); }
 
           /* ======================= shim FP: softfp (game) -> hard-float (glibc/libm/GL) ======================= */
@@ -526,8 +587,19 @@ jobs:
           AAPCS static double w_strtod(const char *s, char **e) { return strtod(s, e); }
           AAPCS static float w_strtof(const char *s, char **e) { return strtof(s, e); }
           AAPCS static double w_atof(const char *s) { return atof(s); }
-          AAPCS static int w___fpclassifyf(float x) { return __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x); }
-          AAPCS static int w___fpclassify(double x) { return __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x); }
+
+          /* KONSTANTA FP_*: nilai bionic (INFINITE=1 NAN=2 NORMAL=4 SUBNORMAL=8 ZERO=0x10) BERBEDA dari glibc (NAN=0 INFINITE=1 ZERO=2 SUBNORMAL=3 NORMAL=4).
+           * Dengan nilai glibc, angka 0.0 terbaca "NAN" oleh kode game (2 = FP_NAN bionic) -> semua collider dengan komponen nol dianggap tidak valid.
+           * Env CORDY_FPCLASS=glibc mengembalikan perilaku lama. */
+          static int fpc_glibc(void) { static int m = -1; if (m < 0) { const char *e = getenv("CORDY_FPCLASS"); m = (e && !strcmp(e, "glibc")) ? 1 : 0; } return m; }
+          AAPCS static int w___fpclassifyf(float x) {
+            if (fpc_glibc()) return __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x);
+            return __builtin_fpclassify(0x02, 0x01, 0x04, 0x08, 0x10, x);
+          }
+          AAPCS static int w___fpclassify(double x) {
+            if (fpc_glibc()) return __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x);
+            return __builtin_fpclassify(0x02, 0x01, 0x04, 0x08, 0x10, x);
+          }
           AAPCS static int w___isnanf(float x) { return x != x; }
           AAPCS static int w___isinff(float x) { return (x == x && x - x != 0) ? (x > 0 ? 1 : -1) : 0; }
           AAPCS static int w___finitef(float x) { return x - x == 0; }
@@ -586,6 +658,64 @@ jobs:
           static int b_dlclose(void *h) { (void)h; return 0; }
           static const char *b_dlerror(void) { const char *e = dlerr; dlerr = NULL; return e; }
 
+          /* ======================= shim jendela & EGL: pakai konteks SDL yang sudah ada =======================
+           * libunity versi ini membuat permukaan/konteks EGL sendiri dari ANativeWindow. Di sini jendela dan konteks sudah dibuat SDL
+           * (aktif di thread utama), jadi semua pembuatan dipetakan ke yang sudah ada, dan swap dibiarkan ke SDL_GL_SwapWindow. */
+          static int g_fakewin[8];
+          static int g_egl_n;
+          #define ELOG(...) do { if (g_egl_n++ < 60) L(__VA_ARGS__); } while (0)
+          typedef void *(*egl_cur_t)(int);
+          typedef void *(*egl_ctx_t)(void);
+          static void *b_ANativeWindow_fromSurface(void *env, void *surf) { (void)env; (void)surf; ELOG("[egl] ANativeWindow_fromSurface -> jendela palsu\n"); return g_fakewin; }
+          static int b_ANativeWindow_setBuffersGeometry(void *w, int a, int b, int c) { (void)w; ELOG("[egl] ANativeWindow_setBuffersGeometry(%d,%d,%d) diabaikan\n", a, b, c); return 0; }
+          static void *b_eglCreateWindowSurface(void *d, void *c, void *w, const int *a) {
+            static egl_cur_t f; void *r; (void)d; (void)c; (void)w; (void)a;
+            if (!f) *(void **)&f = glsym("eglGetCurrentSurface");
+            r = f ? f(0x3059) : NULL; ELOG("[egl] eglCreateWindowSurface -> permukaan SDL %p\n", r); return r;
+          }
+          static void *b_eglCreateContext(void *d, void *c, void *sh, const int *a) {
+            static egl_ctx_t f; void *r; (void)d; (void)c; (void)sh;
+            if (!f) *(void **)&f = glsym("eglGetCurrentContext");
+            r = f ? f() : NULL; ELOG("[egl] eglCreateContext(attr=%d) -> konteks SDL %p\n", a ? a[1] : -1, r); return r;
+          }
+          static int b_eglMakeCurrent(void *d, void *dr, void *rd, void *c) { (void)d; (void)dr; (void)rd; ELOG("[egl] eglMakeCurrent(ctx=%p) diabaikan (sudah aktif)\n", c); return 1; }
+          static int b_eglSwapBuffers(void *d, void *s) { (void)d; (void)s; return 1; }
+          static int b_egl_true2(void *d, void *x) { (void)d; (void)x; ELOG("[egl] destroy/terminate diabaikan\n"); return 1; }
+          static int b_egl_true1(void *d) { (void)d; ELOG("[egl] eglTerminate diabaikan\n"); return 1; }
+          static int b_system_property_get(const char *n, char *v) { (void)n; if (v) v[0] = 0; return 0; }
+          static unsigned long long b_uldivmod_helper(unsigned long long a, unsigned long long b, unsigned long long *rem) {
+            if (!b) { if (rem) *rem = 0; return 0; }
+            if (rem) *rem = a % b;
+            return a / b;
+          }
+
+          /* ======================= shim NativeActivity / input / sensor (Unity 4.5) =======================
+           * libunity 4.5 memanggil fungsi NativeActivity milik libmain.so (tidak kita muat) serta looper/sensor Android.
+           * Di sini semuanya dibuat "kosong yang aman": tidak ada antrian input dari Android, tidak ada sensor. */
+          static int g_fakelooper[4], g_fakesm[4], g_fakesq[4];
+          static int g_na_n;
+          #define NLOG(...) do { if (g_na_n++ < 40) L(__VA_ARGS__); } while (0)
+          static void *b_na_getInputQueue(void) { NLOG("[na] ANativeActivity_getInputQueue -> NULL\n"); return NULL; }
+          static void b_na_void0(void) { }
+          static void b_na_void1(int a) { NLOG("[na] ANativeActivity_setFirstLevelHasBeenLoaded/enableWatchdog(%d)\n", a); }
+          static void b_na_fwd(void *e, void *env) { (void)e; (void)env; }
+          static void *b_ALooper_prepare(int o) { (void)o; NLOG("[na] ALooper_prepare\n"); return g_fakelooper; }
+          static void *b_ALooper_forThread(void) { return g_fakelooper; }
+          static int b_ALooper_pollAll(int t, int *fd, int *ev, void **data) { (void)t; if (fd) *fd = 0; if (ev) *ev = 0; if (data) *data = NULL; return -3; }
+          static void b_AInputQueue_attachLooper(void *q, void *l, int id, void *cb, void *d) { (void)q; (void)l; (void)id; (void)cb; (void)d; NLOG("[na] AInputQueue_attachLooper diabaikan\n"); }
+          static int b_AInputQueue_getEvent(void *q, void **e) { (void)q; if (e) *e = NULL; return -1; }
+          static int b_AInputQueue_preDispatchEvent(void *q, void *e) { (void)q; (void)e; return 0; }
+          static void b_AInputQueue_finishEvent(void *q, void *e, int h) { (void)q; (void)e; (void)h; }
+          static void *b_ASensorManager_getInstance(void) { NLOG("[na] ASensorManager_getInstance -> palsu\n"); return g_fakesm; }
+          static void *b_ASensorManager_getDefaultSensor(void *m, int t) { (void)m; NLOG("[na] ASensorManager_getDefaultSensor(%d) -> NULL (tidak ada sensor)\n", t); return NULL; }
+          static int b_ASensorManager_getSensorList(void *m, void **l) { (void)m; if (l) *l = NULL; return 0; }
+          static void *b_ASensorManager_createEventQueue(void *m, void *lo, int id, void *cb, void *d) { (void)m; (void)lo; (void)id; (void)cb; (void)d; return g_fakesq; }
+          static int b_ASensorManager_destroyEventQueue(void *m, void *q) { (void)m; (void)q; return 0; }
+          static int b_ASensorEventQueue_zero2(void *q, void *s) { (void)q; (void)s; return 0; }
+          static int b_ASensorEventQueue_setEventRate(void *q, void *s, int r) { (void)q; (void)s; (void)r; return 0; }
+          static int b_ASensorEventQueue_hasEvents(void *q) { (void)q; return 0; }
+          static int b_ASensorEventQueue_getEvents(void *q, void *ev, size_t n) { (void)q; (void)ev; (void)n; return 0; }
+
           /* ======================= tabel shim ======================= */
           typedef struct { const char *name; void *addr; } Shim;
           #define S(n, f) { n, (void *)(f) }
@@ -606,7 +736,7 @@ jobs:
             S("longjmp", cordy_longjmp), S("_longjmp", cordy_longjmp), S("siglongjmp", cordy_longjmp),
             /* stdio dengan FILE* */
             S("fprintf", b_fprintf), S("vfprintf", b_vfprintf), S("fputs", b_fputs), S("fputc", b_fputc), S("putc", b_fputc),
-            S("fwrite", b_fwrite), S("fread", b_fread), S("fflush", b_fflush), S("fgets", b_fgets), S("fgetc", b_fgetc), S("getc", b_fgetc),
+            S("fopen", b_fopen), S("fwrite", b_fwrite), S("fread", b_fread), S("fflush", b_fflush), S("fgets", b_fgets), S("fgetc", b_fgetc), S("getc", b_fgetc),
             S("ungetc", b_ungetc), S("setvbuf", b_setvbuf), S("feof", b_feof), S("ferror", b_ferror), S("clearerr", b_clearerr),
             S("fclose", b_fclose), S("fseek", b_fseek), S("ftell", b_ftell), S("fileno", b_fileno), S("fgetpos", b_fgetpos), S("fsetpos", b_fsetpos),
             /* file/dir */
@@ -628,6 +758,7 @@ jobs:
             S("pthread_getattr_np", b_getattr_np), S("pthread_create", b_pthread_create),
             /* sinyal */
             S("sigaction", b_sigaction), S("sigprocmask", b_sigprocmask), S("pthread_sigmask", b_pthread_sigmask), S("sigsuspend", b_sigsuspend),
+            S("pthread_kill", b_pthread_kill), S("kill", b_kill), S("raise", b_raise),
             /* dl */
             S("dlopen", b_dlopen), S("dlsym", b_dlsym), S("dlclose", b_dlclose), S("dlerror", b_dlerror),
             /* FP softfp */
@@ -641,6 +772,21 @@ jobs:
             S("__isnan", w_isnan), S("__isinf", w_isinf), S("__finite", w_finite),
             SW(glClearColor), SW(glColor4f), SW(glClearDepthf), SW(glAlphaFunc), SW(glFogf), SW(glLightModelf), SW(glLightf),
             SW(glMaterialf), SW(glTexParameterf), SW(glTexEnvf),
+            S("ANativeWindow_fromSurface", b_ANativeWindow_fromSurface), S("ANativeWindow_setBuffersGeometry", b_ANativeWindow_setBuffersGeometry),
+            S("eglCreateWindowSurface", b_eglCreateWindowSurface), S("eglCreateContext", b_eglCreateContext), S("eglMakeCurrent", b_eglMakeCurrent),
+            S("eglSwapBuffers", b_eglSwapBuffers), S("eglDestroySurface", b_egl_true2), S("eglDestroyContext", b_egl_true2), S("eglTerminate", b_egl_true1),
+            S("__system_property_get", b_system_property_get), S("__gnu_uldivmod_helper", b_uldivmod_helper),
+            S("_Z29ANativeActivity_getInputQueuev", b_na_getInputQueue), S("_Z42ANativeActivity_setFirstLevelHasBeenLoadedb", b_na_void1),
+            S("_Z30ANativeActivity_enableWatchdogb", b_na_void1), S("_Z28ANativeActivity_feedWatchdogv", b_na_void0),
+            S("_Z42ANativeActivity_forwardMotionEventToDalvikP11AInputEventP7_JNIEnv", b_na_fwd),
+            S("ALooper_prepare", b_ALooper_prepare), S("ALooper_forThread", b_ALooper_forThread), S("ALooper_pollAll", b_ALooper_pollAll),
+            S("AInputQueue_attachLooper", b_AInputQueue_attachLooper), S("AInputQueue_getEvent", b_AInputQueue_getEvent),
+            S("AInputQueue_preDispatchEvent", b_AInputQueue_preDispatchEvent), S("AInputQueue_finishEvent", b_AInputQueue_finishEvent),
+            S("ASensorManager_getInstance", b_ASensorManager_getInstance), S("ASensorManager_getDefaultSensor", b_ASensorManager_getDefaultSensor),
+            S("ASensorManager_getSensorList", b_ASensorManager_getSensorList), S("ASensorManager_createEventQueue", b_ASensorManager_createEventQueue),
+            S("ASensorManager_destroyEventQueue", b_ASensorManager_destroyEventQueue), S("ASensorEventQueue_enableSensor", b_ASensorEventQueue_zero2),
+            S("ASensorEventQueue_disableSensor", b_ASensorEventQueue_zero2), S("ASensorEventQueue_setEventRate", b_ASensorEventQueue_setEventRate),
+            S("ASensorEventQueue_hasEvents", b_ASensorEventQueue_hasEvents), S("ASensorEventQueue_getEvents", b_ASensorEventQueue_getEvents),
             { NULL, NULL }
           };
 
@@ -671,7 +817,19 @@ jobs:
             p[0] = 0xE59F0000u; p[1] = 0xE59FF000u; p[2] = U32(name); p[3] = U32(unres_handler);
             return p;
           }
+          static const char *const trace_names[] = { "_Znwj", "_Znaj", "_ZdlPv", "_ZdaPv", "_ZnwjRKSt9nothrow_t", "malloc", "calloc", "realloc", "free", "memalign", "posix_memalign", "sbrk", "brk", NULL };
+          static void *resolve_inner(const char *n, int weak);
           static void *resolve(const char *n, int weak) {
+            void *p = resolve_inner(n, weak); int i;
+            for (i = 0; trace_names[i]; i++) if (!strcmp(trace_names[i], n)) {
+              Dl_info di; int has = p && dladdr(p, &di) && di.dli_fname;
+              char d[200]; describe((uintptr_t)p & ~1u, d, sizeof d);
+              L("[resolve] %-22s -> %p  (%s)\n", n, p, d[0] != '?' ? d : (has ? di.dli_fname : "?"));
+              break;
+            }
+            return p;
+          }
+          static void *resolve_inner(const char *n, int weak) {
             void *p; int i;
             for (i = 0; i < nmods; i++) if ((p = mod_find(&mods[i], n))) { g_kc[1]++; return p; }
             for (i = 0; shims[i].name; i++) if (!strcmp(shims[i].name, n)) { g_kc[2]++; note(g_shimhit, &g_nsh, 256, shims[i].name); return shims[i].addr; }
@@ -784,7 +942,8 @@ jobs:
           #define JM_MTH 0x4a4d5448u
           #define JM_FLD 0x4a464c44u
           #define JM_STR 0x4a535452u
-          typedef struct { uint32_t magic; char *s; char a[96]; char b[96]; char c[128]; } JObj;
+          #define JM_BYT 0x4a425954u
+          typedef struct { uint32_t magic; char *s; char a[96]; char b[96]; char c[128]; uint32_t n; } JObj;
           typedef struct { char *name; char *sig; void *fn; } JNINM;
           typedef struct { char cls[96]; char name[64]; char sig[96]; void *fn; } Nat;
           static Nat nats[160]; static int nnat;
@@ -797,16 +956,506 @@ jobs:
             snprintf(o->a, sizeof o->a, "%s", a ? a : ""); snprintf(o->b, sizeof o->b, "%s", b ? b : ""); snprintf(o->c, sizeof o->c, "%s", c ? c : "");
             return o;
           }
+          static char g_cwd[400], g_apkabs[1024];
+          static JObj *jstr(const char *t) { JObj *o = jnew(JM_STR, "java/lang/String", "", ""); o->s = strdup(t ? t : ""); return o; }
+          static JObj *jstrobj(const char *cls) { JObj *o = jnew(JM_STR, cls, "", ""); o->s = strdup(""); return o; }
+          static JObj *jclsobj(const char *cls) { return jnew(JM_CLS, cls, "", ""); }
           static uint32_t jcall(int slot, void *mid);
+          static uint32_t jcall_v(int slot, void *mid, va_list ap);
+          static uint32_t jcall_a(int slot, void *mid, const void *a);
+          static uint64_t jcall64(int slot, void *mid);
+          static uint32_t jnewobj(int slot, void *mid);
+          static uint32_t jnewobj_v(int slot, void *mid, va_list ap);
+          static uint32_t jnewobj_a(int slot, void *mid, const void *a);
           static uint32_t jtrap(int slot);
           #include "stubs.inc"
+          /* ======================= PlayerPrefs nyata (default benar + persisten) =======================
+           * Sebelumnya: GetInt/GetFloat selalu 0 dan GetString "" (argumen default dibuang) -> script game mendapat nilai nol
+           * (mis. skala/massa/kecepatan = 0). Sekarang: nilai tersimpan dibaca, bila tidak ada dikembalikan argumen default. */
+          typedef struct { char k[96]; char t; int i; float f; char s[256]; } PPE;
+          static PPE g_pp[256]; static int g_npp, g_pp_loaded, g_pp_dirty, g_pplog;
+          static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+          static void pp_clean(char *s) { for (; *s; s++) if (*s == '\t' || *s == '\n' || *s == '\r') *s = ' '; }
+          static void pp_save(void) {
+            char p[460], tmp[470]; FILE *fp; int i;
+            snprintf(p, sizeof p, "%s/files/prefs.txt", g_cwd); snprintf(tmp, sizeof tmp, "%s.tmp", p);
+            fp = fopen(tmp, "w"); if (!fp) { L("[prefs] gagal menulis %s: %s\n", tmp, strerror(errno)); return; }
+            for (i = 0; i < g_npp; i++) {
+              if (g_pp[i].t == 'I') fprintf(fp, "I\t%s\t%d\n", g_pp[i].k, g_pp[i].i);
+              else if (g_pp[i].t == 'F') fprintf(fp, "F\t%s\t%.9g\n", g_pp[i].k, (double)g_pp[i].f);
+              else fprintf(fp, "S\t%s\t%s\n", g_pp[i].k, g_pp[i].s);
+            }
+            fclose(fp); rename(tmp, p); g_pp_dirty = 0;
+          }
+          static void pp_load(void) {
+            char p[460], ln[512]; FILE *fp; g_pp_loaded = 1;
+            snprintf(p, sizeof p, "%s/files/prefs.txt", g_cwd);
+            fp = fopen(p, "r"); if (!fp) { L("[prefs] belum ada %s (mulai kosong)\n", p); return; }
+            while (fgets(ln, sizeof ln, fp) && g_npp < 256) {
+              char *a, *b; size_t n = strlen(ln); PPE *e;
+              while (n && (ln[n - 1] == '\n' || ln[n - 1] == '\r')) ln[--n] = 0;
+              if (n < 4 || ln[1] != '\t') continue;
+              a = ln + 2; b = strchr(a, '\t'); if (!b) continue; *b++ = 0;
+              e = &g_pp[g_npp++]; memset(e, 0, sizeof *e);
+              snprintf(e->k, sizeof e->k, "%.95s", a); e->t = ln[0];
+              if (e->t == 'I') { const char *q = b; int neg = 0, v = 0; if (*q == '-') { neg = 1; q++; } while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0'); e->i = neg ? -v : v; } else if (e->t == 'F') e->f = (float)atof(b); else snprintf(e->s, sizeof e->s, "%s", b);
+            }
+            fclose(fp); L("[prefs] dimuat %d kunci dari %s\n", g_npp, p);
+          }
+          static PPE *pp_find(const char *k) { int i; for (i = 0; i < g_npp; i++) if (!strcmp(g_pp[i].k, k)) return &g_pp[i]; return NULL; }
+          static PPE *pp_slot(const char *k) {
+            PPE *e = pp_find(k);
+            if (!e && g_npp < 256) { e = &g_pp[g_npp++]; memset(e, 0, sizeof *e); snprintf(e->k, sizeof e->k, "%s", k); }
+            return e;
+          }
+          /* vap != NULL: argumen dari va_list; selain itu dari array jvalue (8 byte per argumen) */
+          static uint32_t jcall_pp(const JObj *m, va_list *vap, const uint8_t *ja) {
+            const JObj *key = NULL, *sv = NULL; int iv = 0; float fv = 0; char t; const char *p, *ks = NULL, *res = NULL; PPE *e; uint32_t r = 0;
+            if (!g_pp_loaded) pp_load();
+            if (!strcmp(m->b, "Sync")) { if (g_pp_dirty) pp_save(); return 0; }
+            if (!strcmp(m->b, "DeleteAll")) { g_npp = 0; g_pp_dirty = 1; pp_save(); return 0; }
+            p = strstr(m->c, "String;"); t = p ? p[7] : 0;
+            if (vap) {
+              key = va_arg(*vap, const JObj *);
+              if (t == 'I') iv = va_arg(*vap, int); else if (t == 'F') fv = (float)va_arg(*vap, double); else if (t == 'L') sv = va_arg(*vap, const JObj *);
+            } else if (ja) {
+              key = *(const JObj *const *)(const void *)ja;
+              if (t == 'I') memcpy(&iv, ja + 8, 4); else if (t == 'F') memcpy(&fv, ja + 8, 4); else if (t == 'L') sv = *(const JObj *const *)(const void *)(ja + 8);
+            }
+            if (!key || key->magic != JM_STR || !key->s) return 0;
+            ks = key->s; if (sv && sv->magic != JM_STR) sv = NULL;
+            e = pp_find(ks);
+            if (!strcmp(m->b, "HasKey")) r = e ? 1u : 0u;
+            else if (!strcmp(m->b, "DeleteKey")) { if (e) { *e = g_pp[--g_npp]; g_pp_dirty = 1; } }
+            else if (!strncmp(m->b, "Set", 3)) {
+              e = pp_slot(ks);
+              if (e) {
+                if (!strcmp(m->b, "SetInt")) { e->t = 'I'; e->i = iv; }
+                else if (!strcmp(m->b, "SetFloat")) { e->t = 'F'; e->f = fv; }
+                else { e->t = 'S'; snprintf(e->s, sizeof e->s, "%s", sv && sv->s ? sv->s : ""); pp_clean(e->s); }
+                g_pp_dirty = 1;
+              }
+              r = 1u;
+            }
+            else if (!strcmp(m->b, "GetInt")) r = (uint32_t)((e && e->t == 'I') ? e->i : iv);
+            else if (!strcmp(m->b, "GetFloat")) r = f2u((e && e->t == 'F') ? e->f : fv);
+            else if (!strcmp(m->b, "GetString")) { res = (e && e->t == 'S') ? e->s : (sv && sv->s ? sv->s : ""); r = U32(jstr(res)); }
+            if (g_pplog++ < 400) {
+              if (!strcmp(m->b, "GetInt")) L("[prefs] %s(\"%s\", def=%d) -> %d%s\n", m->b, ks, iv, (int)r, e ? "" : " (default)");
+              else if (!strcmp(m->b, "GetFloat")) { float rf; memcpy(&rf, &r, 4); L("[prefs] %s(\"%s\", def=%g) -> %g%s\n", m->b, ks, (double)fv, (double)rf, e ? "" : " (default)"); }
+              else if (res) L("[prefs] %s(\"%s\") -> \"%s\"%s\n", m->b, ks, res, e ? "" : " (default)");
+              else if (!strcmp(m->b, "SetInt")) L("[prefs] SetInt(\"%s\", %d)\n", ks, iv);
+              else if (!strcmp(m->b, "SetFloat")) L("[prefs] SetFloat(\"%s\", %g)\n", ks, (double)fv);
+              else L("[prefs] %s(\"%s\") -> %u\n", m->b, ks, r);
+            }
+            return r;
+          }
+          /* ======================= Java palsu: refleksi Unity + kelas Java buatan game (FileIO, CordyHelper, ...) =======================
+           * Unity 4.5 mencari kelas lewat Class.forName dan ReflectionHelper.getMethodID (+ FromReflectedMethod). Game Cordy membaca isi
+           * (asset bundle) lewat com.silvertree.cordy.FileIO.LoadAsset dan menyimpan data lewat SaveGameData. Di sini semuanya ditiru di C. */
+          typedef struct { uint32_t lo, hi; } JArg;
+          static int g_hostlog;
+          static const JObj *jo(uint32_t v) { return (v && !(v & 3u)) ? (const JObj *)(uintptr_t)v : NULL; }
+          static const char *jstrv(uint32_t v) { const JObj *o = jo(v); return (o && o->magic == JM_STR && o->s) ? o->s : ""; }
+          static JObj *jbytes(const uint8_t *src, size_t n) {
+            JObj *o = jnew(JM_BYT, "[B", "", "");
+            o->s = malloc(n ? n : 1);
+            if (src && n) memcpy(o->s, src, n); else memset(o->s, 0, n ? n : 1);
+            o->n = (uint32_t)n;
+            return o;
+          }
+          /* argumen panggilan Java dibaca dari tanda tangan metode: va_list (vap) atau array jvalue (ja, 8 byte per argumen) */
+          static int jargs(const char *sig, va_list *vap, const uint8_t *ja, JArg *a, int max) {
+            const char *p = sig; int n = 0;
+            if (*p == '(') p++;
+            while (*p && *p != ')' && n < max) {
+              char t = *p; JArg x; x.lo = 0; x.hi = 0;
+              if (t == '[') { while (*p == '[') p++; if (*p == 'L') { while (*p && *p != ';') p++; } if (*p) p++; t = 'L'; }
+              else if (t == 'L') { while (*p && *p != ';') p++; if (*p) p++; }
+              else p++;
+              if (vap) {
+                switch (t) {
+                  case 'J': { long long v = va_arg(*vap, long long); x.lo = (uint32_t)v; x.hi = (uint32_t)((unsigned long long)v >> 32); break; }
+                  case 'D': { double v = va_arg(*vap, double); memcpy(&x, &v, 8); break; }
+                  case 'F': { float v = (float)va_arg(*vap, double); memcpy(&x.lo, &v, 4); break; }
+                  case 'L': x.lo = (uint32_t)(uintptr_t)va_arg(*vap, void *); break;
+                  default: x.lo = (uint32_t)va_arg(*vap, int); break;
+                }
+              } else if (ja) {
+                const uint8_t *q = ja + 8 * n;
+                switch (t) {
+                  case 'Z': case 'B': x.lo = q[0]; break;
+                  case 'C': case 'S': x.lo = (uint32_t)q[0] | ((uint32_t)q[1] << 8); break;
+                  case 'J': case 'D': memcpy(&x, q, 8); break;
+                  default: memcpy(&x.lo, q, 4); break;
+                }
+              }
+              a[n++] = x;
+            }
+            return n;
+          }
+
+          /* ---- inflate kecil (gaya puff, domain publik/zlib) untuk entri APK yang terkompresi (mis. resources.csv) ---- */
+          typedef struct { const uint8_t *in; size_t inlen, incnt; uint8_t *out; size_t outlen, outcnt; long bitbuf; int bitcnt; } PState;
+          typedef struct { short *count; short *symbol; } Huff;
+          static int pbits(PState *s, int need) {
+            long val = s->bitbuf;
+            while (s->bitcnt < need) {
+              if (s->incnt == s->inlen) return -1;
+              val |= (long)(s->in[s->incnt++]) << s->bitcnt;
+              s->bitcnt += 8;
+            }
+            s->bitbuf = val >> need; s->bitcnt -= need;
+            return (int)(val & ((1L << need) - 1));
+          }
+          static int pdecode(PState *s, const Huff *h) {
+            int len, code = 0, first = 0, count, index = 0;
+            for (len = 1; len <= 15; len++) {
+              int b = pbits(s, 1);
+              if (b < 0) return -1;
+              code |= b; count = h->count[len];
+              if (code - count < first) return h->symbol[index + (code - first)];
+              index += count; first += count; first <<= 1; code <<= 1;
+            }
+            return -10;
+          }
+          static int pconstruct(Huff *h, const short *length, int n) {
+            int symbol, len, left; short offs[16];
+            for (len = 0; len <= 15; len++) h->count[len] = 0;
+            for (symbol = 0; symbol < n; symbol++) h->count[length[symbol]]++;
+            if (h->count[0] == n) return 0;
+            left = 1;
+            for (len = 1; len <= 15; len++) { left <<= 1; left -= h->count[len]; if (left < 0) return left; }
+            offs[1] = 0;
+            for (len = 1; len < 15; len++) offs[len + 1] = (short)(offs[len] + h->count[len]);
+            for (symbol = 0; symbol < n; symbol++) if (length[symbol] != 0) h->symbol[offs[length[symbol]]++] = (short)symbol;
+            return left;
+          }
+          static int pcodes(PState *s, const Huff *lc, const Huff *dc) {
+            static const short lens[29] = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 };
+            static const short lext[29] = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 };
+            static const short dists[30] = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 };
+            static const short dext[30] = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
+            int symbol, len, e; unsigned dist;
+            do {
+              symbol = pdecode(s, lc);
+              if (symbol < 0) return symbol;
+              if (symbol < 256) { if (s->outcnt == s->outlen) return 1; s->out[s->outcnt++] = (uint8_t)symbol; }
+              else if (symbol > 256) {
+                symbol -= 257;
+                if (symbol >= 29) return -10;
+                e = pbits(s, lext[symbol]); if (e < 0) return -1;
+                len = lens[symbol] + e;
+                symbol = pdecode(s, dc);
+                if (symbol < 0) return symbol;
+                if (symbol >= 30) return -10;
+                e = pbits(s, dext[symbol]); if (e < 0) return -1;
+                dist = (unsigned)(dists[symbol] + e);
+                if (dist > s->outcnt) return -11;
+                if (s->outcnt + (size_t)len > s->outlen) return 1;
+                while (len--) { s->out[s->outcnt] = s->out[s->outcnt - dist]; s->outcnt++; }
+              }
+            } while (symbol != 256);
+            return 0;
+          }
+          static int pfixed(PState *s) {
+            short lencnt[16], lensym[288], distcnt[16], distsym[30], lengths[288]; Huff lc, dc; int symbol;
+            lc.count = lencnt; lc.symbol = lensym; dc.count = distcnt; dc.symbol = distsym;
+            for (symbol = 0; symbol < 144; symbol++) lengths[symbol] = 8;
+            for (; symbol < 256; symbol++) lengths[symbol] = 9;
+            for (; symbol < 280; symbol++) lengths[symbol] = 7;
+            for (; symbol < 288; symbol++) lengths[symbol] = 8;
+            pconstruct(&lc, lengths, 288);
+            for (symbol = 0; symbol < 30; symbol++) lengths[symbol] = 5;
+            pconstruct(&dc, lengths, 30);
+            return pcodes(s, &lc, &dc);
+          }
+          static int pdynamic(PState *s) {
+            static const short order[19] = { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
+            short lengths[320], lencnt[16], lensym[286], distcnt[16], distsym[30]; Huff lc, dc; int nlen, ndist, ncode, index, err, x;
+            lc.count = lencnt; lc.symbol = lensym; dc.count = distcnt; dc.symbol = distsym;
+            nlen = pbits(s, 5); ndist = pbits(s, 5); ncode = pbits(s, 4);
+            if (nlen < 0 || ndist < 0 || ncode < 0) return -1;
+            nlen += 257; ndist += 1; ncode += 4;
+            if (nlen > 286 || ndist > 30) return -3;
+            for (index = 0; index < ncode; index++) { x = pbits(s, 3); if (x < 0) return -1; lengths[order[index]] = (short)x; }
+            for (; index < 19; index++) lengths[order[index]] = 0;
+            err = pconstruct(&lc, lengths, 19);
+            if (err != 0) return -4;
+            index = 0;
+            while (index < nlen + ndist) {
+              int symbol, len = 0;
+              symbol = pdecode(s, &lc);
+              if (symbol < 0) return symbol;
+              if (symbol < 16) lengths[index++] = (short)symbol;
+              else {
+                if (symbol == 16) { if (index == 0) return -5; len = lengths[index - 1]; x = pbits(s, 2); if (x < 0) return -1; symbol = 3 + x; }
+                else if (symbol == 17) { x = pbits(s, 3); if (x < 0) return -1; symbol = 3 + x; }
+                else { x = pbits(s, 7); if (x < 0) return -1; symbol = 11 + x; }
+                if (index + symbol > nlen + ndist) return -6;
+                while (symbol--) lengths[index++] = (short)len;
+              }
+            }
+            if (lengths[256] == 0) return -9;
+            err = pconstruct(&lc, lengths, nlen);
+            if (err && (err < 0 || nlen != lc.count[0] + lc.count[1])) return -7;
+            err = pconstruct(&dc, lengths + nlen, ndist);
+            if (err && (err < 0 || ndist != dc.count[0] + dc.count[1])) return -8;
+            return pcodes(s, &lc, &dc);
+          }
+          static int pinflate(PState *s) {
+            int last, type, err = 0;
+            s->outcnt = 0; s->bitbuf = 0; s->bitcnt = 0; s->incnt = 0;
+            do {
+              last = pbits(s, 1); type = pbits(s, 2);
+              if (last < 0 || type < 0) return -1;
+              if (type == 0) {
+                unsigned len;
+                s->bitbuf = 0; s->bitcnt = 0;
+                if (s->incnt + 4 > s->inlen) return 2;
+                len = s->in[s->incnt++]; len |= (unsigned)s->in[s->incnt++] << 8;
+                s->incnt += 2;
+                if (s->incnt + len > s->inlen) return 2;
+                if (s->outcnt + len > s->outlen) return 1;
+                while (len--) s->out[s->outcnt++] = s->in[s->incnt++];
+              } else if (type == 1) err = pfixed(s);
+              else if (type == 2) err = pdynamic(s);
+              else err = -1;
+              if (err != 0) break;
+            } while (!last);
+            return err;
+          }
+
+          /* ---- baca satu berkas dari APK (zip): stored atau deflate ---- */
+          static uint32_t rd16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+          static uint32_t rd32(const uint8_t *p) { return rd16(p) | (rd16(p + 2) << 16); }
+          static uint8_t *zip_read(const char *apk, const char *entry, size_t *outn) {
+            FILE *f = fopen(apk, "rb"); uint8_t *tail = NULL, *cd = NULL, *res = NULL, lh[30]; long fsz; size_t tn, i, el = strlen(entry);
+            uint32_t cdoff = 0, cdsz = 0, cnt = 0, k; const uint8_t *p;
+            *outn = 0;
+            if (!f) { L("[zip] gagal membuka %s: %s\n", apk, strerror(errno)); return NULL; }
+            fseek(f, 0, SEEK_END); fsz = ftell(f);
+            tn = fsz < 70000 ? (size_t)fsz : 70000;
+            tail = malloc(tn); fseek(f, fsz - (long)tn, SEEK_SET);
+            if (!tail || fread(tail, 1, tn, f) != tn) { fclose(f); free(tail); return NULL; }
+            for (i = tn >= 22 ? tn - 22 : 0; ; i--) {
+              if (tn >= 22 && rd32(tail + i) == 0x06054b50u) { cnt = rd16(tail + i + 10); cdsz = rd32(tail + i + 12); cdoff = rd32(tail + i + 16); break; }
+              if (i == 0) break;
+            }
+            free(tail);
+            if (!cnt || !cdsz) { fclose(f); L("[zip] direktori pusat tidak ditemukan di %s\n", apk); return NULL; }
+            cd = malloc(cdsz); fseek(f, (long)cdoff, SEEK_SET);
+            if (!cd || fread(cd, 1, cdsz, f) != cdsz) { fclose(f); free(cd); return NULL; }
+            p = cd;
+            for (k = 0; k < cnt && (size_t)(p - cd) + 46 <= cdsz; k++) {
+              uint32_t method = rd16(p + 10), csz = rd32(p + 20), usz = rd32(p + 24), nl = rd16(p + 28), xl = rd16(p + 30), cl = rd16(p + 32), lho = rd32(p + 42);
+              if (rd32(p) != 0x02014b50u) break;
+              if (nl == el && !memcmp(p + 46, entry, el)) {
+                uint8_t *comp; uint32_t dataoff;
+                fseek(f, (long)lho, SEEK_SET);
+                if (fread(lh, 1, 30, f) != 30 || rd32(lh) != 0x04034b50u) break;
+                dataoff = lho + 30 + rd16(lh + 26) + rd16(lh + 28);
+                comp = malloc(csz ? csz : 1); fseek(f, (long)dataoff, SEEK_SET);
+                if (!comp || fread(comp, 1, csz, f) != csz) { free(comp); break; }
+                if (method == 0) { res = comp; *outn = csz; }
+                else if (method == 8) {
+                  PState s; uint8_t *o = malloc(usz ? usz : 1); int r;
+                  memset(&s, 0, sizeof s); s.in = comp; s.inlen = csz; s.out = o; s.outlen = usz;
+                  r = o ? pinflate(&s) : -99;
+                  if (r == 0 && s.outcnt == usz) { res = o; *outn = usz; } else { L("[zip] inflate gagal (%d) untuk %s\n", r, entry); free(o); }
+                  free(comp);
+                } else { L("[zip] metode kompresi %u tidak didukung (%s)\n", method, entry); free(comp); }
+                break;
+              }
+              p += 46 + nl + xl + cl;
+            }
+            free(cd); fclose(f);
+            return res;
+          }
+
+          static uint8_t *file_read_all(const char *path, size_t *outn) {
+            FILE *f = fopen(path, "rb"); long n; uint8_t *b;
+            *outn = 0;
+            if (!f) return NULL;
+            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            if (n < 0) { fclose(f); return NULL; }
+            b = malloc(n ? (size_t)n : 1);
+            if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(b); return NULL; }
+            fclose(f); *outn = (size_t)n;
+            return b;
+          }
+          static int gamedata_path(const char *name, char *out, size_t n) {
+            if (!name[0] || strchr(name, '/') || strstr(name, "..")) return -1;
+            snprintf(out, n, "%s/files/%s", g_cwd, name);
+            return 0;
+          }
+
+          /* metode Java yang ditiru. Mengembalikan 1 bila ditangani; *ret = nilai balik 32-bit (float sebagai pola bit) */
+          static int jhost(const JObj *m, const JArg *a, int na, uint32_t *ret) {
+            const char *c = m->a, *n = m->b;
+            (void)na;
+            if (!strcmp(c, "java/lang/Class")) {
+              if (!strcmp(n, "forName")) {
+                char t[128]; size_t i;
+                snprintf(t, sizeof t, "%s", jstrv(a[0].lo));
+                for (i = 0; t[i]; i++) if (t[i] == '.') t[i] = '/';
+                *ret = U32(jclsobj(t)); return 1;
+              }
+              return 0;
+            }
+            if (!strcmp(c, "com/unity3d/player/ReflectionHelper")) {
+              const JObj *k = jo(a[0].lo);
+              const char *kn = (k && (k->magic == JM_CLS || k->magic == JM_STR) && k->a[0]) ? k->a : "java/lang/Object";
+              if (!strcmp(n, "getMethodID")) { *ret = U32(jnew(JM_MTH, kn, jstrv(a[1].lo), jstrv(a[2].lo))); return 1; }
+              if (!strcmp(n, "getFieldID")) { *ret = U32(jnew(JM_FLD, kn, jstrv(a[1].lo), jstrv(a[2].lo))); return 1; }
+              if (!strcmp(n, "getConstructorID")) { *ret = U32(jnew(JM_MTH, kn, "<init>", jstrv(a[1].lo))); return 1; }
+              return 0;
+            }
+            if (!strcmp(c, "com/silvertree/cordy/FileIO") || !strcmp(c, "com/silvertree/cordy/fileio/FileIOImp")) {
+              char path[600]; size_t len = 0; uint8_t *data;
+              if (!strcmp(n, "LoadAsset")) {
+                snprintf(path, sizeof path, "assets/cordy_asset_data/%s", jstrv(a[0].lo));
+                data = zip_read(g_apkabs, path, &len);
+                L("[host] FileIO.LoadAsset(\"%s\", %u) -> %s (%u byte)\n", jstrv(a[0].lo), (unsigned)a[1].lo, data ? "ADA" : "TIDAK ADA", (unsigned)len);
+                *ret = data ? U32(jbytes(data, len)) : 0u; free(data); return 1;
+              }
+              if (!strcmp(n, "DoesGameDataExist")) {
+                struct stat st; *ret = (gamedata_path(jstrv(a[0].lo), path, sizeof path) == 0 && stat(path, &st) == 0) ? 1u : 0u;
+                L("[host] FileIO.DoesGameDataExist(\"%s\") -> %u\n", jstrv(a[0].lo), (unsigned)*ret); return 1;
+              }
+              if (!strcmp(n, "LoadGameData")) {
+                data = (gamedata_path(jstrv(a[0].lo), path, sizeof path) == 0) ? file_read_all(path, &len) : NULL;
+                L("[host] FileIO.LoadGameData(\"%s\") -> %s (%u byte)\n", jstrv(a[0].lo), data ? "ADA" : "TIDAK ADA", (unsigned)len);
+                *ret = data ? U32(jbytes(data, len)) : 0u; free(data); return 1;
+              }
+              if (!strcmp(n, "SaveGameData")) {
+                const JObj *b = jo(a[1].lo); *ret = 0;
+                if (b && b->magic == JM_BYT && gamedata_path(jstrv(a[0].lo), path, sizeof path) == 0) {
+                  char tmp[640]; FILE *fp; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+                  fp = fopen(tmp, "wb");
+                  if (fp) { fwrite(b->s, 1, b->n, fp); fflush(fp); fsync(fileno(fp)); fclose(fp); rename(tmp, path); }
+                  L("[host] FileIO.SaveGameData(\"%s\", %u byte) -> %s\n", jstrv(a[0].lo), (unsigned)b->n, fp ? "OK" : "GAGAL");
+                } else L("[host] FileIO.SaveGameData(\"%s\") argumen tidak valid\n", jstrv(a[0].lo));
+                return 1;
+              }
+              if (!strcmp(n, "DoesLiteGameDataExist") || !strcmp(n, "LoadLiteGameData") || !strcmp(n, "Test") || !strcmp(n, "Test2")) { *ret = 0; return 1; }
+              return 0;
+            }
+            if (!strcmp(c, "com/silvertree/cordy/CordyHelper")) {
+              if (!strcmp(n, "getDPI")) { *ret = f2u(160.0f); return 1; }
+              if (!strcmp(n, "getPackagePath")) { *ret = U32(jstr(g_apkabs)); return 1; }
+              if (!strcmp(n, "getCPUHz")) { *ret = U32(jstr("1200000")); return 1; }
+              if (!strcmp(n, "getGLRendererName")) { *ret = U32(jstr("Mali-G31")); return 1; }
+              if (!strcmp(n, "getGLVendor")) { *ret = U32(jstr("ARM")); return 1; }
+              if (!strcmp(n, "getGLVersion")) { *ret = U32(jstr("OpenGL ES 2.0")); return 1; }
+              if (!strcmp(n, "IsBadMultitouch") || !strcmp(n, "doesKeyBoardExist") || !strcmp(n, "isSlideOpen") || !strcmp(n, "isTablet")) { *ret = 0; return 1; }
+              return 0;
+            }
+            if (!strcmp(c, "com/silvertree/cordy/ScreenEvent") && !strcmp(n, "IsPhoneUnlocked")) { *ret = 1; return 1; }
+            if (!strcmp(c, "com/silvertree/cordy/AnalyticsWrapper") || !strcmp(c, "com/silvertree/cordy/Billing")) {
+              if (!strcmp(n, "PopMessage")) { *ret = U32(jstr("")); return 1; }
+              if (!strcmp(n, "Inst")) return 0;
+              *ret = 0; return 1;
+            }
+            return 0;
+          }
+          static int jdispatch(const JObj *m, va_list *vap, const uint8_t *ja, uint32_t *r) {
+            JArg a[8]; int n, h;
+            if (!m || m->magic != JM_MTH) return 0;
+            memset(a, 0, sizeof a);
+            n = jargs(m->c, vap, ja, a, 8);
+            h = jhost(m, a, n, r);
+            if (h && g_hostlog++ < 200) L("[host] %s.%s%s -> 0x%x\n", m->a, m->b, m->c, (unsigned)*r);
+            return h;
+          }
+          /* fungsi JNI array byte */
+          static int j_GetArrayLength(void *e, const JObj *o) { (void)e; return (o && o->magic == JM_BYT) ? (int)o->n : 0; }
+          static void *j_NewByteArray(void *e, int n) { (void)e; return jbytes(NULL, n < 0 ? 0 : (size_t)n); }
+          static void *j_GetByteArrayElements(void *e, const JObj *o, uint8_t *copy) { (void)e; if (copy) *copy = 0; return (o && o->magic == JM_BYT) ? (void *)o->s : NULL; }
+          static void j_ReleaseByteArrayElements(void *e, const JObj *o, void *p, int mode) { (void)e; (void)o; (void)p; (void)mode; }
+          static void j_GetByteArrayRegion(void *e, const JObj *o, int st, int len, void *buf) {
+            (void)e;
+            if (o && o->magic == JM_BYT && st >= 0 && len >= 0 && (uint32_t)st + (uint32_t)len <= o->n) memcpy(buf, o->s + st, (size_t)len);
+          }
+          static void j_SetByteArrayRegion(void *e, const JObj *o, int st, int len, const void *buf) {
+            (void)e;
+            if (o && o->magic == JM_BYT && st >= 0 && len >= 0 && (uint32_t)st + (uint32_t)len <= o->n) memcpy(o->s + st, buf, (size_t)len);
+          }
+          static void *j_Reflected(void *e, void *x) { (void)e; return x; }
+          static void *j_ToReflected(void *e, void *cls, void *mid, int st) { (void)e; (void)cls; (void)st; return mid; }
+
+
+          static int is_pp(const JObj *m) { return m && m->magic == JM_MTH && strstr(m->a, "PlayerPrefs") && strcmp(m->b, "<init>") != 0; }
+          static uint32_t jcall_v(int slot, void *mid, va_list ap) {
+            const JObj *m = (const JObj *)mid;
+            if (is_pp(m)) { va_list cp; uint32_t r; va_copy(cp, ap); r = jcall_pp(m, &cp, NULL); va_end(cp); return r; }
+            { va_list cp; uint32_t r = 0; int h; va_copy(cp, ap); h = jdispatch(m, &cp, NULL, &r); va_end(cp); if (h) return r; }
+            return jcall(slot, mid);
+          }
+          static uint32_t jcall_a(int slot, void *mid, const void *a) {
+            const JObj *m = (const JObj *)mid;
+            if (is_pp(m)) return jcall_pp(m, NULL, (const uint8_t *)a);
+            { uint32_t r = 0; if (jdispatch(m, NULL, (const uint8_t *)a, &r)) return r; }
+            return jcall(slot, mid);
+          }
           static uint32_t jcall(int slot, void *mid) {
             const JObj *m = (const JObj *)mid;
-            if (g_jlog++ < 600) {
+            if (g_jlog++ < 1500) {
               if (mid && m->magic == JM_MTH) L("[JNI] %s -> %s.%s%s\n", jni_names[slot], m->a, m->b, m->c);
               else L("[JNI] %s(?)\n", jni_names[slot]);
             }
+            if (m && m->magic == JM_MTH) {
+              const char *rt = strrchr(m->c, ')'); rt = rt ? rt + 1 : "";
+              if (!strcmp(rt, "Ljava/lang/String;")) {
+                char b[600];
+                if (!strcmp(m->b, "getCacheDir")) snprintf(b, sizeof b, "%s/cache", g_cwd);
+                else if (strstr(m->b, "Dir") || strstr(m->b, "Path")) snprintf(b, sizeof b, "%s/files", g_cwd);
+                else if (!strcmp(m->b, "getCPUType")) snprintf(b, sizeof b, "armv7");
+                else if (!strcmp(m->b, "getPhoneModel")) snprintf(b, sizeof b, "RG40XXV");
+                else if (!strcmp(m->b, "getDeviceID")) snprintf(b, sizeof b, "anbernic-rg40xxv-cordy");
+                else b[0] = 0;
+                return U32(jstr(b));
+              }
+              if (rt[0] == 'L') return U32(jstrobj(rt));   /* objek palsu non-NULL supaya native tidak dereference NULL */
+              if (!strcmp(m->b, "getOSVersion")) return 15u;   /* sama dengan SDK_INT palsu */
+              if (!strcmp(m->b, "getTotalMemory")) return 1024u;   /* UnityPlayer.getTotalMemory()I -> MB (RG40XXV: 1 GB) */
+              if (strstr(m->a, "PlayerPrefs")) {   /* SetInt/SetFloat/SetString (Z) = sukses; HasKey = belum ada. Belum dipersistenkan (argumen tidak dibaca). */
+                if (!strncmp(m->b, "Set", 3)) return 1u;
+                if (!strcmp(m->b, "HasKey")) return 0u;
+              }
+            }
             return 0;
+          }
+          /* NewObject*: kembalikan objek palsu NON-NULL bertipe kelasnya (sebelumnya NULL -> NullReference di sisi Unity). WWW: catat URL. */
+          static uint32_t jnewobj(int slot, void *mid) {
+            const JObj *m = (const JObj *)mid;
+            if (g_jlog++ < 1500) L("[JNI] %s -> %s.%s%s\n", jni_names[slot], m && m->magic == JM_MTH ? m->a : "?", m && m->magic == JM_MTH ? m->b : "?", m && m->magic == JM_MTH ? m->c : "");
+            return U32(jstrobj(m && m->magic == JM_MTH && m->a[0] ? m->a : "java/lang/Object"));
+          }
+          static void www_log(const JObj *m, int h, const JObj *url, const JObj *post) {
+            if (m && m->magic == JM_MTH && !strcmp(m->a, "com/unity3d/player/WWW"))
+              L("[WWW] baru: handle=%d url=\"%s\" post=%s\n", h, (url && url->magic == JM_STR) ? url->s : "?", post ? "ada" : "tidak");
+          }
+          static uint32_t jnewobj_v(int slot, void *mid, va_list ap) {
+            const JObj *m = (const JObj *)mid;
+            if (m && m->magic == JM_MTH && !strcmp(m->a, "com/unity3d/player/WWW")) {
+              va_list cp; int h; const JObj *u, *p;
+              va_copy(cp, ap); h = va_arg(cp, int); u = va_arg(cp, const JObj *); p = va_arg(cp, const JObj *); va_end(cp);
+              www_log(m, h, u, p);
+            }
+            return jnewobj(slot, mid);
+          }
+          static uint32_t jnewobj_a(int slot, void *mid, const void *a) {
+            const JObj *m = (const JObj *)mid;
+            if (m && m->magic == JM_MTH && a) { const uint32_t *w = (const uint32_t *)a; www_log(m, (int)w[0], (const JObj *)(uintptr_t)w[2], (const JObj *)(uintptr_t)w[4]); }   /* jvalue = 8 byte */
+            return jnewobj(slot, mid);
+          }
+          /* panggilan Java bertipe long (J): hasil 64-bit di r0:r1. CordyHelper.getTotalMemory()J: 0 -> game menampilkan dialog "Not Enough Memory". */
+          static uint64_t jcall64(int slot, void *mid) {
+            const JObj *m = (const JObj *)mid;
+            uint32_t lo = jcall(slot, mid);
+            if (m && m->magic == JM_MTH && !strcmp(m->b, "getTotalMemory")) return 1073741824ull;
+            return (uint64_t)lo;
           }
           static uint32_t jtrap(int slot) {
             static uint8_t seen[233];
@@ -818,7 +1467,9 @@ jobs:
           static void *j_Null(void) { return NULL; }
           static void j_Void(void) {}
           static void *j_NewRef(void *e, void *o) { (void)e; return o; }
-          static void *j_GetObjectClass(void *e, void *o) { (void)e; (void)o; return jnew(JM_CLS, "java/lang/Object", "", ""); }
+          static void *j_GetObjectClass(void *e, void *o) { const JObj *p = (const JObj *)o; (void)e; return jnew(JM_CLS, (p && p->magic == JM_STR && p->a[0]) ? p->a : "java/lang/Object", "", ""); }
+          static int j_GetStaticInt(void *e, const JObj *c, const JObj *f) { (void)e; (void)c; return (f && !strcmp(f->b, "SDK_INT")) ? 15 : 0; }
+          static void *j_GetStaticObj(void *e, const JObj *c, const JObj *f) { (void)e; (void)c; if (f && !strcmp(f->b, "MODEL")) return jstr("RG40XXV"); if (f && f->c[0] == 'L' && strstr(f->c, "String")) return jstr("Anbernic"); return NULL; }
           static void *j_GetMethodID(void *e, const JObj *cls, const char *name, const char *sig) {
             (void)e; if (g_jlog++ < 600) L("[JNI] GetMethodID(%s.%s%s)\n", cls && cls->magic == JM_CLS ? cls->a : "?", name, sig);
             return jnew(JM_MTH, cls && cls->magic == JM_CLS ? cls->a : "?", name, sig);
@@ -857,11 +1508,77 @@ jobs:
             g_jni[31] = (void *)j_GetObjectClass; g_jni[33] = (void *)j_GetMethodID; g_jni[94] = (void *)j_GetFieldID;
             g_jni[113] = (void *)j_GetMethodID; g_jni[144] = (void *)j_GetFieldID; g_jni[167] = (void *)j_NewStringUTF;
             g_jni[168] = (void *)j_GetStringUTFLength; g_jni[169] = (void *)j_GetStringUTFChars; g_jni[170] = (void *)j_Void;
-            g_jni[171] = (void *)j_Null; g_jni[215] = (void *)j_RegisterNatives; g_jni[219] = (void *)j_GetJavaVM; g_jni[228] = (void *)j_Null;
+            g_jni[171] = (void *)j_GetArrayLength; g_jni[215] = (void *)j_RegisterNatives; g_jni[219] = (void *)j_GetJavaVM; g_jni[228] = (void *)j_Null;
             g_vm_tab[3] = (void *)vm_ok; g_vm_tab[4] = (void *)vm_Attach; g_vm_tab[5] = (void *)vm_ok; g_vm_tab[6] = (void *)vm_GetEnv; g_vm_tab[7] = (void *)vm_Attach;
+            for (i = 0; i < 233; i++) {
+              if (!strcmp(jni_names[i], "GetStaticIntField")) g_jni[i] = (void *)j_GetStaticInt;
+              else if (!strcmp(jni_names[i], "GetStaticObjectField")) g_jni[i] = (void *)j_GetStaticObj;
+              else if (!strcmp(jni_names[i], "FromReflectedMethod") || !strcmp(jni_names[i], "FromReflectedField")) g_jni[i] = (void *)j_Reflected;
+              else if (!strcmp(jni_names[i], "ToReflectedMethod") || !strcmp(jni_names[i], "ToReflectedField")) g_jni[i] = (void *)j_ToReflected;
+              else if (!strcmp(jni_names[i], "NewByteArray")) g_jni[i] = (void *)j_NewByteArray;
+              else if (!strcmp(jni_names[i], "GetByteArrayElements") || !strcmp(jni_names[i], "GetPrimitiveArrayCritical")) g_jni[i] = (void *)j_GetByteArrayElements;
+              else if (!strcmp(jni_names[i], "ReleaseByteArrayElements") || !strcmp(jni_names[i], "ReleasePrimitiveArrayCritical")) g_jni[i] = (void *)j_ReleaseByteArrayElements;
+              else if (!strcmp(jni_names[i], "GetByteArrayRegion")) g_jni[i] = (void *)j_GetByteArrayRegion;
+              else if (!strcmp(jni_names[i], "SetByteArrayRegion")) g_jni[i] = (void *)j_SetByteArrayRegion;
+            }
             (void)g_unity_cls;
           }
 
+          static void selftest_alloc(void) {
+            void *(*nw)(size_t) = (void *(*)(size_t))resolve_inner("_Znwj", 1);
+            void *a = malloc(0x94), *b = NULL, *c;
+            L("[selftest] malloc(0x94) = %p | sbrk(0) = %p\n", a, sbrk(0));
+            if (nw) { b = nw(0x94); L("[selftest] _Znwj(0x94) [pakai hasil resolve] = %p\n", b); }
+            else L("[selftest] _Znwj tidak ter-resolve\n");
+            c = malloc(0x94);
+            L("[selftest] malloc lagi = %p\n", c);
+            if (b && ((uintptr_t)b & 0xF0000000u) != ((uintptr_t)a & 0xF0000000u)) L("[selftest] !!! _Znwj mengembalikan pointer di luar heap glibc (nibble atas beda)\n");
+            else if (b) L("[selftest] _Znwj tampak normal\n");
+          }
+
+          /* Pengaman crash: setelah "Supplied NxActorDesc is not valid. createActor returns NULL" Unity memanggil
+           * NxActor::raise/clearBodyFlag(NX_BF_KINEMATIC=0x80) lewat vtable pada pointer NULL (libunity+0xe95c4, SIGSEGV addr 0).
+           * Penambal: fungsi itu langsung return bila m_actor (this+0x2c) NULL. Hanya dipasang bila byte aslinya cocok persis.
+           * Matikan dengan env CORDY_NOPATCH=1. Ini hanya agar game lanjut dan log berikutnya terlihat; penyebab actor gagal tetap dicari. */
+
+          static int apply_patch(Mod *m, const char *name, uint32_t v, const uint8_t *orig, const uint8_t *neu, size_t n) {
+            uint8_t *a; uintptr_t pg, pe;
+            if (v + n > m->minv + m->span) { L("[patch] %s: di luar modul\n", name); return -1; }
+            a = (uint8_t *)(m->bias + v);
+            if (memcmp(a, orig, n) != 0) { L("[patch] %s: byte tidak cocok, tidak dipasang\n", name); return -1; }
+            pg = (uintptr_t)a & ~(uintptr_t)(PAGE - 1); pe = ((uintptr_t)a + n + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+            if (mprotect((void *)pg, pe - pg, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) { L("[patch] %s: mprotect RWX gagal: %s\n", name, strerror(errno)); return -1; }
+            memcpy(a, neu, n);
+            mprotect((void *)pg, pe - pg, PROT_READ | PROT_EXEC);
+            __builtin___clear_cache((char *)a, (char *)a + n);
+            L("[patch] %s terpasang di libunity+0x%x\n", name, v);
+            return 0;
+          }
+          static void patch_nullactor(Mod *m) {
+
+            /* (3) fungsi saudara (libunity+0xe94e0): clear/raise body flag (frozen axes 0x7e) pada actor NULL */
+            static const uint8_t o3a[32] = { 0x2c,0x30,0x90,0xe5, 0x00,0x40,0xa0,0xe1, 0x7e,0x50,0x01,0xe2, 0x03,0x00,0xa0,0xe1, 0x7e,0x10,0xa0,0xe3, 0x00,0x30,0x93,0xe5, 0x0f,0xe0,0xa0,0xe1, 0x6c,0xf1,0x93,0xe5 };
+            static const uint8_t n3a[32] = { 0x00,0x40,0xa0,0xe1, 0x2c,0x00,0x94,0xe5, 0x7e,0x50,0x01,0xe2, 0x00,0x00,0x50,0xe3, 0x00,0x30,0x90,0x15, 0x7e,0x10,0xa0,0x13, 0x0f,0xe0,0xa0,0x11, 0x6c,0xf1,0x93,0x15 };
+            static const uint8_t o3b[24] = { 0x2c,0x30,0x94,0xe5, 0x05,0x10,0xa0,0xe1, 0x03,0x00,0xa0,0xe1, 0x00,0x30,0x93,0xe5, 0x0f,0xe0,0xa0,0xe1, 0x68,0xf1,0x93,0xe5 };
+            static const uint8_t n3b[24] = { 0x2c,0x00,0x94,0xe5, 0x00,0x00,0x50,0xe3, 0x00,0x30,0x90,0x15, 0x05,0x10,0xa0,0x11, 0x0f,0xe0,0xa0,0x11, 0x68,0xf1,0x93,0x15 };
+            /* (1) NxActor::raise/clearBodyFlag(0x80) pada actor NULL (libunity+0xe95c8) */
+            static const uint8_t o1[24] = { 0x2c,0x30,0x90,0xe5, 0x80,0x10,0xa0,0xe3, 0x03,0x00,0xa0,0xe1, 0x00,0x30,0x93,0xe5, 0x0f,0xe0,0xa0,0xe1, 0x70,0xf1,0x93,0xe5 };
+            static const uint8_t n1[24] = { 0x2c,0x00,0x90,0xe5, 0x00,0x00,0x50,0xe3, 0x00,0x30,0x90,0x15, 0x80,0x10,0xa0,0x13, 0x0f,0xe0,0xa0,0x11, 0x70,0xf1,0x93,0x15 };
+            /* (2) fungsi sinkron pose Unity->actor (libunity+0xf7518): tiga panggilan vtable pada this+0x2c (actor) tanpa cek NULL.
+             * Bentuk asli: ldr r3,[r5,#0x2c]; mov r1,sp; mov r0,r3; ldr r3,[r3]; mov lr,pc; ldr pc,[r3,#SLOT]
+             * Bentuk baru : ldr r0,[r5,#0x2c]; cmp r0,#0; ldrne r3,[r0]; movne r1,sp; movne lr,pc; ldrne pc,[r3,#SLOT] */
+            static const uint8_t o2a[24] = { 0x2c,0x30,0x95,0xe5, 0x0d,0x10,0xa0,0xe1, 0x03,0x00,0xa0,0xe1, 0x00,0x30,0x93,0xe5, 0x0f,0xe0,0xa0,0xe1, 0x18,0xf0,0x93,0xe5 };
+            static const uint8_t n2a[24] = { 0x2c,0x00,0x95,0xe5, 0x00,0x00,0x50,0xe3, 0x00,0x30,0x90,0x15, 0x0d,0x10,0xa0,0x11, 0x0f,0xe0,0xa0,0x11, 0x18,0xf0,0x93,0x15 };
+            static const uint8_t o2b[24] = { 0x2c,0x30,0x95,0xe5, 0x0d,0x10,0xa0,0xe1, 0x03,0x00,0xa0,0xe1, 0x00,0x30,0x93,0xe5, 0x0f,0xe0,0xa0,0xe1, 0x38,0xf0,0x93,0xe5 };
+            static const uint8_t n2b[24] = { 0x2c,0x00,0x95,0xe5, 0x00,0x00,0x50,0xe3, 0x00,0x30,0x90,0x15, 0x0d,0x10,0xa0,0x11, 0x0f,0xe0,0xa0,0x11, 0x38,0xf0,0x93,0x15 };
+            if (getenv("CORDY_NOPATCH")) { L("[patch] nullactor dilewati (CORDY_NOPATCH)\n"); return; }
+            apply_patch(m, "nullactor-flag", 0xe95c8, o1, n1, 24);
+            apply_patch(m, "nullactor-pose1", 0xf75d0, o2a, n2a, 24);
+            apply_patch(m, "nullactor-pose2", 0xf75f0, o2a, n2a, 24);
+            apply_patch(m, "nullactor-pose3", 0xf7608, o2b, n2b, 24);
+          apply_patch(m, "nullactor-frozen1", 0xe94e4, o3a, n3a, 32);
+          apply_patch(m, "nullactor-frozen2", 0xe9504, o3b, n3b, 24);
+          }
           /* --dump MOD:VADDRHEX:LENHEX  -> cetak byte kode modul (setelah relokasi) untuk dianalisis offline */
           typedef struct { char mod[16]; uint32_t v, len; } DumpReq;
           static DumpReq dumps[12]; static int ndump;
@@ -924,26 +1641,551 @@ jobs:
             L("[ctor] %s selesai\n", m->name);
           }
 
+          /* ======================= STAGE 3: SDL2 + konteks GLES2 + loop Unity ======================= */
+          static void *sdl_h, *g_win, *g_ctx;
+          static int (*p_SDL_Init)(uint32_t);
+          static const char *(*p_SDL_GetError)(void);
+          static int (*p_SDL_GL_SetAttribute)(int, int);
+          static void *(*p_SDL_CreateWindow)(const char *, int, int, int, int, uint32_t);
+          static void *(*p_SDL_GL_CreateContext)(void *);
+          static void (*p_SDL_GL_SwapWindow)(void *);
+          static void (*p_SDL_GL_GetDrawableSize)(void *, int *, int *);
+          static int (*p_SDL_GL_SetSwapInterval)(int);
+          static int (*p_SDL_PollEvent)(void *);
+          static const char *(*p_SDL_GetCurrentVideoDriver)(void);
+          static int (*p_SDL_InitSubSystem)(uint32_t);
+          static int (*p_SDL_NumJoysticks)(void);
+          static void *(*p_SDL_JoystickOpen)(int);
+          static const char *(*p_SDL_JoystickName)(void *);
+          static int (*p_SDL_IsGameController)(int);
+          static void *(*p_SDL_GameControllerOpen)(int);
+          static const unsigned char *(*p_glGetString)(unsigned);
+          static unsigned (*p_glGetError)(void);
+          static void (*p_glEnable)(unsigned), (*p_glDisable)(unsigned), (*p_glScissor)(int, int, int, int);
+          static void (*p_glClearColor)(float, float, float, float), (*p_glClear)(unsigned);
+          static void (*p_glGetIntegerv)(unsigned, int *), (*p_glGetFloatv)(unsigned, float *);
+          static unsigned char (*p_glIsEnabled)(unsigned);
+          static int g_sw = 640, g_sh = 480;
+
+          static void *glfn(const char *n) {
+            void *p = NULL;
+            if (h_gl2 && (p = dlsym(h_gl2, n))) return p;
+            if (h_mali && (p = dlsym(h_mali, n))) return p;
+            if (h_gl1) p = dlsym(h_gl1, n);
+            return p;
+          }
+
+          static int gl_init(int *w, int *h) {
+            static const char *libs[] = { "libSDL2-2.0.so.0", "/usr/lib32/libSDL2-2.0.so.0", "libSDL2.so", NULL };
+            int i, ww = 0, hh = 0;
+            for (i = 0; libs[i] && !sdl_h; i++) { sdl_h = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL); L("[sdl] dlopen %s : %s\n", libs[i], sdl_h ? "OK" : dlerror()); }
+            if (!sdl_h) return -1;
+          #define SYM(n) do { *(void **)&p_##n = dlsym(sdl_h, #n); if (!p_##n) { L("[sdl] simbol %s tidak ada\n", #n); return -1; } } while (0)
+            SYM(SDL_Init); SYM(SDL_GetError); SYM(SDL_GL_SetAttribute); SYM(SDL_CreateWindow); SYM(SDL_GL_CreateContext);
+            SYM(SDL_GL_SwapWindow); SYM(SDL_GL_GetDrawableSize); SYM(SDL_GL_SetSwapInterval); SYM(SDL_PollEvent); SYM(SDL_GetCurrentVideoDriver);
+          #undef SYM
+            if (p_SDL_Init(0x00000020u) != 0) { L("[sdl] SDL_Init(VIDEO) gagal: %s\n", p_SDL_GetError()); return -1; }
+            L("[sdl] video driver: %s\n", p_SDL_GetCurrentVideoDriver() ? p_SDL_GetCurrentVideoDriver() : "?");
+            p_SDL_GL_SetAttribute(17, 2);  /* CONTEXT_MAJOR_VERSION = 2 (settings.xml: gles_mode=2) */
+            p_SDL_GL_SetAttribute(18, 0);
+            p_SDL_GL_SetAttribute(21, 4);  /* PROFILE_MASK = ES */
+            p_SDL_GL_SetAttribute(0, 8); p_SDL_GL_SetAttribute(1, 8); p_SDL_GL_SetAttribute(2, 8); p_SDL_GL_SetAttribute(3, 0);
+            p_SDL_GL_SetAttribute(5, 1); p_SDL_GL_SetAttribute(6, 16); p_SDL_GL_SetAttribute(7, 8);
+            g_win = p_SDL_CreateWindow("Cordy", 0x1FFF0000, 0x1FFF0000, 640, 480, 0x00000002u | 0x00001001u);
+            if (!g_win) { L("[sdl] SDL_CreateWindow gagal: %s\n", p_SDL_GetError()); return -1; }
+            g_ctx = p_SDL_GL_CreateContext(g_win);
+            if (!g_ctx) { L("[sdl] SDL_GL_CreateContext (GLES2) gagal: %s\n", p_SDL_GetError()); return -1; }
+            p_SDL_GL_SetSwapInterval(1);
+            p_SDL_GL_GetDrawableSize(g_win, &ww, &hh);
+            *w = ww > 0 ? ww : 640; *h = hh > 0 ? hh : 480;
+            *(void **)&p_glGetString = glfn("glGetString"); *(void **)&p_glGetError = glfn("glGetError");
+            if (p_glGetString) {
+              L("[gl] VENDOR   : %s\n", (const char *)p_glGetString(0x1F00));
+              L("[gl] RENDERER : %s\n", (const char *)p_glGetString(0x1F01));
+              L("[gl] VERSION  : %s\n", (const char *)p_glGetString(0x1F02));
+              L("[gl] EXTENSIONS: %.700s\n", (const char *)p_glGetString(0x1F03));
+            }
+            L("[gl] ukuran drawable: %dx%d\n", *w, *h);
+            return 0;
+          }
+
+          /* ---- panggilan native UnityPlayer ---- */
+          typedef void (*fn_v_t)(void *, void *);
+          typedef int (*fn_r_t)(void *, void *);
+          typedef void (*fn_i_t)(void *, void *, int);
+          typedef void (*fn_ii_t)(void *, void *, int, int);
+          typedef void (*fn_iiii_t)(void *, void *, int, int, int, int);
+          typedef void (*fn_p_t)(void *, void *, void *);
+          typedef void (*fn_pp_t)(void *, void *, void *, void *);
+          typedef void (AAPCS *fn_touch_t)(void *, void *, int, float, float, int, int64_t, int);
+          static void *nf(const char *name) { int i; for (i = 0; i < nnat; i++) if (!strcmp(nats[i].name, name)) return nats[i].fn; L("[native] %s TIDAK terdaftar\n", name); return NULL; }
+          static void *g_nenv, *g_nobj;
+          static fn_touch_t g_ntouch;
+          static int64_t now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000; }
+
+          /* ---- gamepad: 2 mode ----
+           * mode 0 = KURSOR     : D-pad / stik kiri gerak kursor, A/B/X/Y = tap di posisi kursor (cara lama)
+           * mode 1 = CONTROLLER : tombol fisik -> sentuhan multitouch di posisi tombol HUD Cordy (kiri/kanan/lompat/aksi/pause/topi).
+           *                       Stik kanan = kursor sementara (muncul 3 dtk), R2/L2/R3/L3 = tap di kursor (untuk menu & popup).
+           * Ganti mode: ketuk SELECT (tekan lalu lepas tanpa tombol lain). Select+Start tetap keluar. Pilihan terakhir disimpan di padmode.txt.
+           * Posisi tombol HUD bisa diubah tanpa build ulang lewat buttons.cfg (koordinat layar 640x480, kiri-atas = 0,0). */
+          #define MAXF 6
+          enum { H_LEFT, H_RIGHT, H_JUMP, H_ACT, H_PAUSE, H_HAT, H_N };
+          enum { SB_DPAD = 1, SB_STICK = 2, SB_A = 4, SB_B = 8, SB_X = 16, SB_Y = 32, SB_L1 = 64, SB_R1 = 128, SB_START = 256 };
+          typedef struct { const char *name; float x, y; int src; } Hud;
+          static Hud g_hud[H_N] = {
+            { "left", 50.f, 352.f, 0 }, { "right", 137.f, 410.f, 0 }, { "jump", 582.f, 346.f, 0 },
+            { "action", 508.f, 408.f, 0 }, { "pause", 597.f, 72.f, 0 }, { "hat", 597.f, 125.f, 0 } };
+          static struct { int used, key; float x, y; } g_fg[MAXF];
+          static int g_sel_used, g_pad_log, g_btn_back, g_btn_start, g_dp[4], g_dp_hold, g_axv[6], g_padmode;
+          static int g_tapsrc, g_touch_down, g_stkl, g_stkr, g_trig[2], g_toast = 150, g_curshow, g_rs_hold;
+          static float g_cx = 320.f, g_cy = 240.f;
+          /* nativeTouch(int id, float x, float y, int action, long time, int SOURCE). Native Unity 3.5 hanya membalik sumbu Y (koordinat atas-kiri -> bawah-kiri)
+           * dan menskala bila source == 0x1002 (SOURCE_TOUCHSCREEN); dengan source=0 ketukan jatuh di Y yang tercermin (480-y) -> "tombol tidak berfungsi". */
+          #define SRC_TOUCHSCREEN 0x1002
+          static int g_ntap_log;
+          static void touch_ev(int id, int action, float x, float y) {
+            if (g_ntap_log < 120 && action != 2) { g_ntap_log++; L("[touch] id=%d action=%d x=%.0f y=%.0f (source=0x%x)\n", id, action, (double)x, (double)y, SRC_TOUCHSCREEN); }
+            if (g_ntouch) g_ntouch(g_nenv, g_nobj, id, x, y, action, now_ms(), SRC_TOUCHSCREEN);
+          }
+          /* kolam jari: id sentuh = slot bebas terendah (seperti pointerId Android); jari pertama = id 0 (juga dipakai emulasi mouse Unity) */
+          static void ft_down(int key, float x, float y) {
+            int i;
+            for (i = 0; i < MAXF; i++) if (g_fg[i].used && g_fg[i].key == key) return;
+            for (i = 0; i < MAXF; i++) if (!g_fg[i].used) { g_fg[i].used = 1; g_fg[i].key = key; g_fg[i].x = x; g_fg[i].y = y; touch_ev(i, 0, x, y); return; }
+          }
+          static void ft_move(int key, float x, float y) {
+            int i;
+            for (i = 0; i < MAXF; i++) if (g_fg[i].used && g_fg[i].key == key) { g_fg[i].x = x; g_fg[i].y = y; touch_ev(i, 2, x, y); return; }
+          }
+          static void ft_up(int key) {
+            int i;
+            for (i = 0; i < MAXF; i++) if (g_fg[i].used && g_fg[i].key == key) { touch_ev(i, 1, g_fg[i].x, g_fg[i].y); g_fg[i].used = 0; return; }
+          }
+          static void pad_init(void) {
+            int i, n;
+          #define OSYM(nm) (*(void **)&p_##nm = dlsym(sdl_h, #nm))
+            OSYM(SDL_InitSubSystem); OSYM(SDL_NumJoysticks); OSYM(SDL_JoystickOpen); OSYM(SDL_JoystickName); OSYM(SDL_IsGameController); OSYM(SDL_GameControllerOpen);
+          #undef OSYM
+            *(void **)&p_glEnable = glfn("glEnable"); *(void **)&p_glDisable = glfn("glDisable"); *(void **)&p_glScissor = glfn("glScissor");
+            *(void **)&p_glClearColor = glfn("glClearColor"); *(void **)&p_glClear = glfn("glClear"); *(void **)&p_glGetIntegerv = glfn("glGetIntegerv");
+            *(void **)&p_glGetFloatv = glfn("glGetFloatv"); *(void **)&p_glIsEnabled = glfn("glIsEnabled");
+            if (!p_SDL_InitSubSystem || p_SDL_InitSubSystem(0x00000200u | 0x00002000u) != 0) { L("[pad] init joystick/controller gagal\n"); return; }
+            n = p_SDL_NumJoysticks ? p_SDL_NumJoysticks() : 0;
+            L("[pad] joystick terdeteksi: %d\n", n);
+            for (i = 0; i < n; i++) {
+              void *j = p_SDL_JoystickOpen ? p_SDL_JoystickOpen(i) : NULL;
+              int gc = p_SDL_IsGameController ? p_SDL_IsGameController(i) : 0;
+              L("[pad] #%d nama=\"%s\" gamecontroller=%d\n", i, (j && p_SDL_JoystickName) ? p_SDL_JoystickName(j) : "?", gc);
+              if (gc && p_SDL_GameControllerOpen) p_SDL_GameControllerOpen(i);
+            }
+          }
+          static const char *skipnum(const char *p) {
+            while (*p == ' ' || *p == '\t') p++;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+            return p;
+          }
+          /* buttons.cfg: satu baris per tombol, "nama x y" (nama: left right jump action pause hat), '#' = komentar. padmode.txt: pilihan mode terakhir. */
+          static void pad_cfg_load(void) {
+            FILE *f = fopen("buttons.cfg", "r");
+            char ln[160];
+            int h;
+            if (!f) L("[pad] buttons.cfg tidak ada, pakai posisi bawaan\n");
+            else {
+              while (fgets(ln, sizeof ln, f)) {
+                char *p = ln, *nm;
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p == '#' || *p == '\n' || *p == '\r' || *p == 0) continue;
+                nm = p;
+                while (*p && *p != ' ' && *p != '\t') p++;
+                if (!*p) continue;
+                *p++ = 0;
+                for (h = 0; h < H_N; h++) if (!strcmp(g_hud[h].name, nm)) { g_hud[h].x = (float)atof(p); g_hud[h].y = (float)atof(skipnum(p)); }
+              }
+              fclose(f);
+            }
+            for (h = 0; h < H_N; h++) L("[pad] HUD %-6s = (%.0f, %.0f)\n", g_hud[h].name, (double)g_hud[h].x, (double)g_hud[h].y);
+            f = fopen("padmode.txt", "r");
+            if (f) {
+              if (fgets(ln, sizeof ln, f)) { if (!strncmp(ln, "controller", 10)) g_padmode = 1; else if (!strncmp(ln, "cursor", 6)) g_padmode = 0; }
+              fclose(f);
+            }
+            L("[pad] mode awal: %s  (ganti: ketuk SELECT)\n", g_padmode ? "CONTROLLER" : "KURSOR");
+          }
+          static void hud_set(int h, int bit, int on) {
+            int was = g_hud[h].src != 0;
+            if (on) g_hud[h].src |= bit; else g_hud[h].src &= ~bit;
+            if (!was && g_hud[h].src) ft_down(10 + h, g_hud[h].x, g_hud[h].y);
+            else if (was && !g_hud[h].src) ft_up(10 + h);
+          }
+          static void cur_tap(int bit, int on) {
+            int was = g_tapsrc != 0;
+            if (on) g_tapsrc |= bit; else g_tapsrc &= ~bit;
+            if (!was && g_tapsrc) { ft_down(100, g_cx, g_cy); g_touch_down = 1; }
+            else if (was && !g_tapsrc) { ft_up(100); g_touch_down = 0; }
+            if (on) g_curshow = 180;
+          }
+          static void pad_release_all(void) {
+            int i;
+            for (i = 0; i < MAXF; i++) if (g_fg[i].used) { touch_ev(i, 1, g_fg[i].x, g_fg[i].y); g_fg[i].used = 0; }
+            for (i = 0; i < H_N; i++) g_hud[i].src = 0;
+            g_tapsrc = 0; g_touch_down = 0; g_stkl = g_stkr = 0; g_trig[0] = g_trig[1] = 0;
+            memset(g_dp, 0, sizeof g_dp);
+          }
+          static void pad_toggle(void) {
+            FILE *f;
+            pad_release_all();
+            g_padmode = !g_padmode; g_toast = 120; g_curshow = 0;
+            L("[pad] mode -> %s\n", g_padmode ? "CONTROLLER" : "KURSOR");
+            f = fopen("padmode.txt", "w");
+            if (f) { fputs(g_padmode ? "controller\n" : "cursor\n", f); fclose(f); }
+          }
+          static void pad_map(int b, int dn) {
+            if (g_padmode == 0) {
+              if (b >= 11 && b <= 14) g_dp[b - 11] = dn;
+              else if (b >= 0 && b <= 3) cur_tap(1 << b, dn);         /* A/B/X/Y = tap di posisi kursor (game sentuh murni) */
+              return;
+            }
+            switch (b) {
+              case 13: hud_set(H_LEFT, SB_DPAD, dn); break;
+              case 14: hud_set(H_RIGHT, SB_DPAD, dn); break;
+              case 0: hud_set(H_JUMP, SB_A, dn); break;
+              case 1: hud_set(H_ACT, SB_B, dn); break;
+              case 2: hud_set(H_HAT, SB_X, dn); break;
+              case 3: hud_set(H_PAUSE, SB_Y, dn); break;
+              case 9: hud_set(H_ACT, SB_L1, dn); break;
+              case 10: hud_set(H_JUMP, SB_R1, dn); break;
+              case 6: hud_set(H_PAUSE, SB_START, dn); break;
+              case 7: case 8: cur_tap(16 << (b - 7), dn); break;       /* L3/R3 = tap di kursor */
+              default: break;
+            }
+          }
+          static void cur_move(float dx, float dy, int *hold) {
+            float sp;
+            if (dx == 0.f && dy == 0.f) { *hold = 0; return; }
+            (*hold)++;
+            sp = *hold < 12 ? 3.f : *hold < 30 ? 7.f : 14.f;
+            g_cx += dx * sp; g_cy += dy * sp;
+            if (g_cx < 0.f) g_cx = 0.f;
+            if (g_cy < 0.f) g_cy = 0.f;
+            if (g_cx > (float)(g_sw - 1)) g_cx = (float)(g_sw - 1);
+            if (g_cy > (float)(g_sh - 1)) g_cy = (float)(g_sh - 1);
+            if (g_touch_down) ft_move(100, g_cx, g_cy);
+          }
+          static float stick(int v) { return (v > 8000 || v < -8000) ? (float)v / 32768.f : 0.f; }
+          static void pad_tick(void) {
+            if (g_padmode == 0) {
+              cur_move((float)(g_dp[3] - g_dp[2]) + stick(g_axv[0]), (float)(g_dp[1] - g_dp[0]) + stick(g_axv[1]), &g_dp_hold);
+              return;
+            }
+            /* controller: stik kiri = kiri/kanan (histeresis), stik kanan = kursor, pelatuk = tap */
+            g_stkl = g_stkl ? (g_axv[0] < -8000) : (g_axv[0] < -14000);
+            g_stkr = g_stkr ? (g_axv[0] > 8000) : (g_axv[0] > 14000);
+            hud_set(H_LEFT, SB_STICK, g_stkl);
+            hud_set(H_RIGHT, SB_STICK, g_stkr);
+            { float rx = stick(g_axv[2]), ry = stick(g_axv[3]);
+              if (rx != 0.f || ry != 0.f) g_curshow = 180;
+              cur_move(rx, ry, &g_rs_hold); }
+            { int t0 = g_axv[4] > 16000, t1 = g_axv[5] > 16000;
+              if (t0 != g_trig[0]) { g_trig[0] = t0; cur_tap(1, t0); }
+              if (t1 != g_trig[1]) { g_trig[1] = t1; cur_tap(2, t1); } }
+          }
+          static void fill_rect(int x, int y, int w, int h, float r, float g, float b) {
+            p_glClearColor(r, g, b, 1.f); p_glScissor(x, y, w, h); p_glClear(0x4000);
+          }
+          static void pad_draw(void) {   /* kursor (kotak putih berbingkai hitam) + penanda mode; glClear+scissor, state GL dipulihkan */
+            int sb[4], x, y, show; float cc[4]; unsigned char was;
+            show = (g_padmode == 0) || g_curshow > 0;
+            if (g_padmode && g_curshow > 0) g_curshow--;
+            if (!show && g_toast <= 0) return;
+            if (!p_glClear || !p_glScissor || !p_glEnable || !p_glDisable || !p_glClearColor) return;
+            sb[0] = 0; sb[1] = 0; sb[2] = g_sw; sb[3] = g_sh; cc[0] = cc[1] = cc[2] = 0.f; cc[3] = 1.f;
+            was = p_glIsEnabled ? p_glIsEnabled(0x0C11) : 0;
+            if (p_glGetIntegerv) p_glGetIntegerv(0x0C10, sb);
+            if (p_glGetFloatv) p_glGetFloatv(0x0C22, cc);
+            p_glEnable(0x0C11);
+            if (show) {
+              x = (int)g_cx; y = g_sh - (int)g_cy;
+              fill_rect(x - 7, y - 7, 14, 14, 0.f, 0.f, 0.f);
+              fill_rect(x - 5, y - 5, 10, 10, 1.f, 1.f, 1.f);
+            }
+            if (g_toast > 0) {              /* penanda mode di tengah-atas: hijau = CONTROLLER, putih = KURSOR */
+              g_toast--;
+              fill_rect(g_sw / 2 - 62, g_sh - 12, 124, 10, 0.f, 0.f, 0.f);
+              if (g_padmode) fill_rect(g_sw / 2 - 60, g_sh - 10, 120, 6, 0.15f, 0.9f, 0.3f);
+              else fill_rect(g_sw / 2 - 60, g_sh - 10, 120, 6, 1.f, 1.f, 1.f);
+            }
+            if (!was) p_glDisable(0x0C11);
+            p_glScissor(sb[0], sb[1], sb[2], sb[3]);
+            p_glClearColor(cc[0], cc[1], cc[2], cc[3]);
+          }
+          /* layout event SDL2 (32-bit): type@0, which@8, button/axis@12, state/value@13 (axis: int16 @16) */
+          static void handle_event(const unsigned char *ev, int *quit) {
+            uint32_t t; memcpy(&t, ev, 4);
+            if (t == 0x100u) *quit = 1;
+            else if (t == 0x300u) { int32_t sym; memcpy(&sym, ev + 20, 4); if (sym == 27) *quit = 1; }
+            else if (t == 0x603u || t == 0x604u) { if (g_pad_log++ < 300) L("[pad] JOY button %d %s\n", ev[12], t == 0x603u ? "TURUN" : "naik"); }
+            else if (t == 0x650u) { int16_t v; memcpy(&v, ev + 16, 2); if (ev[12] < 6) g_axv[ev[12]] = v; }
+            else if (t == 0x651u || t == 0x652u) {
+              int dn = (t == 0x651u), b = ev[12];
+              if (g_pad_log++ < 300) L("[pad] CTRL button %d %s\n", b, dn ? "TURUN" : "naik");
+              if (b == 4) { g_btn_back = dn; if (dn) g_sel_used = 0; else if (!g_sel_used) { pad_toggle(); return; } }   /* ketuk SELECT sendirian = ganti mode */
+              if (b == 6) g_btn_start = dn;
+              if (dn && g_btn_back && b != 4) g_sel_used = 1;     /* SELECT dipakai sebagai kombinasi -> jangan ganti mode saat dilepas */
+              if (g_btn_back && g_btn_start) { *quit = 1; return; }      /* Select+Start = keluar */
+              if (b == 4 || (b == 6 && g_btn_back)) return;
+              pad_map(b, dn);
+            }
+          }
+
+          /* ======================= FMOD jalur "AudioTrack" -> SDL audio =======================
+           * Unity 3.5 memakai FMOD Ex statis di libunity.so dengan output AudioTrack. Di Android, kelas Java org.fmod.FMODAudioDevice
+           * menjalankan thread: fmodGetInfo(0..4) -> buka AudioTrack -> loop { fmodProcess(ByteBuffer); track.write() }.
+           * Libunity tidak memanggil Java untuk audio (tidak ada FindClass AudioTrack di log), jadi thread itu ditiru di sini:
+           * dua native yang didaftarkan lewat RegisterNatives dipanggil langsung, PCM dikirim ke SDL lewat ring buffer.
+           * fmodGetInfo: 0=sample rate, 1=panjang blok (sampel), 2=jumlah blok, 4=jumlah kanal.
+           * FMOD baru siap setelah engine init, jadi dicoba berkala dari loop render sampai berhasil. */
+          typedef struct { int freq; uint16_t format; uint8_t channels, silence; uint16_t samples, padding; uint32_t size;
+                           void (*callback)(void *, uint8_t *, int); void *userdata; } AuSdlSpec;
+          static void *au_dbuf(void *env, void *obj) { (void)env; return obj; }   /* GetDirectBufferAddress: "ByteBuffer" kita = pointer mentah */
+          static int (*au_getinfo)(void *, void *, int);
+          static int (*au_process)(void *, void *, void *);
+          static volatile int g_au_quit;
+          static int g_au_on, g_au_tries;
+          static uint32_t g_au_dev;
+          static void (*au_pause)(uint32_t, int);
+          static uint8_t *au_ring; static uint32_t au_cap, au_fill, au_rd, au_wr;
+          static pthread_mutex_t au_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t au_cv = PTHREAD_COND_INITIALIZER;
+          static unsigned au_underruns; static int au_blkbytes;
+
+          static void au_cb(void *ud, uint8_t *out, int len) {
+            uint32_t n, first;
+            (void)ud;
+            pthread_mutex_lock(&au_mu);
+            n = au_fill < (uint32_t)len ? au_fill : (uint32_t)len;
+            first = au_cap - au_rd; if (first > n) first = n;
+            memcpy(out, au_ring + au_rd, first);
+            if (n > first) memcpy(out + first, au_ring, n - first);
+            au_rd = (au_rd + n) % au_cap; au_fill -= n;
+            if (n < (uint32_t)len) { memset(out + n, 0, (size_t)len - n); au_underruns++; }
+            pthread_cond_signal(&au_cv);
+            pthread_mutex_unlock(&au_mu);
+          }
+
+          static void *au_thread(void *arg) {
+            void *env = (void *)&g_env_p;
+            uint8_t *blk = (uint8_t *)malloc((size_t)au_blkbytes + 4096);
+            unsigned long nb = 0; int i;
+            (void)arg;
+            if (!blk) return NULL;
+            while (!g_au_quit) {
+              int r; uint32_t first;
+              pthread_mutex_lock(&au_mu);
+              while (!g_au_quit && au_cap - au_fill < (uint32_t)au_blkbytes) {
+                struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 4000000;
+                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&au_cv, &au_mu, &ts);
+              }
+              pthread_mutex_unlock(&au_mu);
+              if (g_au_quit) break;
+              r = au_process(env, NULL, blk);
+              nb++;
+              if (nb == 1 || nb == 100 || nb == 1000 || nb == 5000) {
+                int peak = 0; const int16_t *s = (const int16_t *)blk;
+                for (i = 0; i < au_blkbytes / 2; i++) { int v = s[i] < 0 ? -s[i] : s[i]; if (v > peak) peak = v; }
+                L("[audio] blok #%lu: fmodProcess=%d puncak=%d underrun=%u\n", nb, r, peak, au_underruns);
+              }
+              pthread_mutex_lock(&au_mu);
+              first = au_cap - au_wr; if (first > (uint32_t)au_blkbytes) first = (uint32_t)au_blkbytes;
+              memcpy(au_ring + au_wr, blk, first);
+              if ((uint32_t)au_blkbytes > first) memcpy(au_ring, blk + first, (uint32_t)au_blkbytes - first);
+              au_wr = (au_wr + (uint32_t)au_blkbytes) % au_cap; au_fill += (uint32_t)au_blkbytes;
+              pthread_mutex_unlock(&au_mu);
+            }
+            free(blk);
+            return NULL;
+          }
+
+          /* return: 1 = audio jalan, 0 = FMOD belum siap (coba lagi nanti), -1 = gagal permanen (game tanpa suara) */
+          static int audio_try_start(void) {
+            void *env = (void *)&g_env_p; int rate, blk, ch, i;
+            int (*initsub)(uint32_t) = NULL; uint32_t (*openf)(const char *, int, const AuSdlSpec *, AuSdlSpec *, int) = NULL;
+            const char *(*geterr)(void) = NULL;
+            AuSdlSpec want, have; uint32_t dev; pthread_t th; pthread_attr_t at;
+            g_au_tries++;
+            if (!au_getinfo) *(void **)&au_getinfo = nf("fmodGetInfo");
+            if (!au_process) *(void **)&au_process = nf("fmodProcess");
+            if (!au_getinfo || !au_process) { L("[audio] fmodGetInfo/fmodProcess tidak terdaftar -> game tanpa suara\n"); return -1; }
+            g_jni[230] = (void *)au_dbuf;
+            rate = au_getinfo(env, NULL, 0);
+            if (rate <= 0) {
+              if (g_au_tries == 1 || g_au_tries == 10 || g_au_tries == 100) L("[audio] FMOD belum siap (percobaan %d, rate=%d)\n", g_au_tries, rate);
+              return 0;
+            }
+            for (i = 0; i < 5; i++) L("[audio] fmodGetInfo(%d) = %d\n", i, au_getinfo(env, NULL, i));
+            blk = au_getinfo(env, NULL, 1); ch = au_getinfo(env, NULL, 4);
+            if (blk <= 0 || blk > 16384) blk = 1024;
+            if (ch < 1 || ch > 2) ch = 2;
+            au_blkbytes = blk * ch * 2; au_cap = (uint32_t)au_blkbytes * 6;
+            au_ring = (uint8_t *)calloc(1, au_cap);
+            if (!au_ring) return -1;
+            *(void **)&initsub = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_InitSubSystem");
+            *(void **)&openf = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_OpenAudioDevice");
+            *(void **)&au_pause = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_PauseAudioDevice");
+            *(void **)&geterr = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_GetError");
+            if (!initsub || !openf || !au_pause) { L("[audio] simbol SDL audio tidak ada -> game tanpa suara\n"); return -1; }
+            if (initsub(0x00000010u) != 0) { L("[audio] SDL_InitSubSystem(AUDIO) gagal: %s\n", geterr ? geterr() : "?"); return -1; }
+            memset(&want, 0, sizeof want); memset(&have, 0, sizeof have);
+            want.freq = rate; want.format = 0x8010; want.channels = (uint8_t)ch; want.samples = 1024; want.callback = au_cb;
+            { /* info ALSA + daftar driver SDL, lalu coba beberapa kombinasi sampai ada yang terbuka */
+              int (*ndrv)(void) = NULL; const char *(*drvname)(int) = NULL; const char *(*curdrv)(void) = NULL;
+              int (*audinit)(const char *) = NULL; void (*audquit)(void) = NULL;
+              static const char *pref[] = { "pulseaudio", "alsa", "pipewire", NULL };
+              static const char *adev[] = { NULL, "hw:0,0", "plughw:0,0", "hw:1,0", "plughw:1,0", "default", "sysdefault", NULL };
+              int nd = 0, k, pi, ai; char line[256]; FILE *pf;
+              *(void **)&ndrv = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_GetNumAudioDrivers");
+              *(void **)&drvname = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_GetAudioDriver");
+              *(void **)&curdrv = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_GetCurrentAudioDriver");
+              *(void **)&audinit = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_AudioInit");
+              *(void **)&audquit = dlsym(sdl_h ? sdl_h : RTLD_DEFAULT, "SDL_AudioQuit");
+              if (ndrv && drvname) { nd = ndrv(); L("[audio] driver SDL tersedia:"); for (k = 0; k < nd; k++) L(" %s", drvname(k)); L(" | aktif: %s\n", curdrv && curdrv() ? curdrv() : "?"); }
+              if ((pf = fopen("/proc/asound/cards", "r")) != NULL) { while (fgets(line, sizeof line, pf)) L("[audio] asound/cards: %s", line); fclose(pf); }
+              if ((pf = fopen("/proc/asound/pcm", "r")) != NULL) { while (fgets(line, sizeof line, pf)) L("[audio] asound/pcm: %s", line); fclose(pf); }
+              dev = openf(NULL, 0, &want, &have, 0);
+              L("[audio] percobaan awal (driver otomatis, AUDIODEV=%s): %s\n", getenv("AUDIODEV") ? getenv("AUDIODEV") : "-", dev ? "OK" : (geterr ? geterr() : "?"));
+              for (pi = 0; !dev && pref[pi] && audinit && audquit && drvname; pi++) {
+                int have_drv = 0;
+                for (k = 0; k < nd; k++) if (strcmp(drvname(k), pref[pi]) == 0) have_drv = 1;
+                if (!have_drv) continue;
+                for (ai = 0; !dev; ai++) {
+                  if (ai > 0 && !adev[ai]) break;
+                  if (ai > 0 && strcmp(pref[pi], "alsa") != 0) break;      /* AUDIODEV hanya relevan untuk ALSA */
+                  if (adev[ai]) setenv("AUDIODEV", adev[ai], 1); else unsetenv("AUDIODEV");
+                  audquit();
+                  if (audinit(pref[pi]) != 0) { L("[audio] SDL_AudioInit(%s) gagal: %s\n", pref[pi], geterr ? geterr() : "?"); break; }
+                  dev = openf(NULL, 0, &want, &have, 0);
+                  L("[audio] coba driver=%s AUDIODEV=%s : %s\n", pref[pi], adev[ai] ? adev[ai] : "-", dev ? "OK" : (geterr ? geterr() : "?"));
+                }
+              }
+              if (!dev) { L("[audio] SEMUA percobaan SDL audio gagal -> game tanpa suara\n"); return -1; }
+              L("[audio] driver terpakai: %s\n", curdrv && curdrv() ? curdrv() : "?");
+            }
+            g_au_dev = dev;
+            L("[audio] SDL terbuka: dev=%u minta=%dHz/%dch/s16 dapat=%dHz/%dch buf=%u | blok FMOD=%d sampel (%d byte)\n", dev, rate, ch, have.freq, have.channels, (unsigned)have.size, blk, au_blkbytes);
+            pthread_attr_init(&at); pthread_attr_setstacksize(&at, 1u << 20);
+            if (pthread_create(&th, &at, au_thread, NULL) != 0) { L("[audio] gagal membuat thread\n"); return -1; }
+            pthread_detach(th);
+            au_pause(dev, 0);
+            { struct sigaction s2; int sg; static const int sgs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };   /* SDL audio bisa menimpa handler sinyal kita */
+              memset(&s2, 0, sizeof s2); s2.sa_sigaction = on_sig; s2.sa_flags = SA_SIGINFO | SA_ONSTACK;
+              for (sg = 0; sg < 5; sg++) sigaction(sgs[sg], &s2, NULL); }
+            L("[audio] thread FMOD->SDL jalan (setelah %d percobaan)\n", g_au_tries);
+            g_au_on = 1;
+            return 1;
+          }
+          static void audio_poll(int frame) {          /* dipanggil tiap frame dari loop render */
+            if (g_au_on || g_au_tries >= 3000 || frame < 1 || frame % 20 != 0) return;
+            if (audio_try_start() < 0) g_au_tries = 3000;
+          }
+          static void audio_stop(void) {
+            if (!g_au_on) return;
+            g_au_quit = 1;
+            if (au_pause && g_au_dev) au_pause(g_au_dev, 1);
+            pthread_cond_broadcast(&au_cv);
+            { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 80000000L; nanosleep(&ts, NULL); }
+            L("[audio] berhenti (underrun total=%u)\n", au_underruns);
+          }
+
+          static void run_stage3(const char *apk, int na, int nb, int frames) {
+            int w = 640, h = 480, f, quit = 0, nerr = 0, r = 0;
+            char libdir[480], files[480], cache[480];
+            void *env = (void *)&g_env_p, *obj = jstrobj("com/unity3d/player/UnityPlayer");
+            void *f_file = nf("nativeFile"), *f_initjni = nf("initJni"), *f_www = nf("nativeInitWWW"), *f_extras = nf("nativeSetExtras");
+            void *f_init = nf("nativeInit"), *f_recreate = nf("nativeRecreateGfxState"), *f_resize = nf("nativeResize");
+            void *f_uinit = nf("unityAndroidInit"), *f_uprep = nf("unityAndroidPrepareGameLoop"), *f_resume = nf("nativeResume");
+            void *f_focus = nf("nativeFocusChanged"), *f_render = nf("nativeRender"), *f_pause = nf("nativePause");
+            void *f_fwd = nf("nativeForwardEventsToDalvik");
+            struct sigaction sa;
+            g_nenv = env; g_nobj = obj;
+            *(void **)&g_ntouch = nf("nativeTouch");
+            if (!f_file || (!f_init && !f_initjni) || !f_render || !f_resize) { L("[stage3] native penting tidak lengkap, berhenti\n"); return; }
+            if (!getcwd(g_cwd, sizeof g_cwd)) snprintf(g_cwd, sizeof g_cwd, ".");
+            { char *rp = realpath(apk, NULL); if (rp) { snprintf(g_apkabs, sizeof g_apkabs, "%s", rp); free(rp); } else snprintf(g_apkabs, sizeof g_apkabs, "%s/%s", g_cwd, apk); }
+            snprintf(libdir, sizeof libdir, "%s/lib", g_cwd); snprintf(files, sizeof files, "%s/files", g_cwd); snprintf(cache, sizeof cache, "%s/cache", g_cwd);
+            mkdir(libdir, 0755); mkdir(files, 0755); mkdir(cache, 0755);
+
+            L("\n== STAGE 3: jendela SDL2 + konteks GLES2 ==\n");
+            if (gl_init(&w, &h) != 0) { L("[stage3] GL gagal, berhenti\n"); return; }
+            g_sw = w; g_sh = h; g_cx = (float)w / 2; g_cy = (float)h / 2;
+            pad_init();
+          pad_cfg_load();
+            { static const int sgs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT }; int k;   /* SDL/Mali bisa menimpa handler sinyal kita */
+              memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_sig; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+              for (k = 0; k < 5; k++) sigaction(sgs[k], &sa, NULL); }
+
+            L("\n== urutan init Unity (mengikuti UnityPlayer.java) ==\n");
+            L("nativeFile(\"%s\")\n", g_apkabs);
+            ((fn_p_t)f_file)(env, obj, jstr(g_apkabs));
+            if (f_fwd) { L("nativeForwardEventsToDalvik(0)\n"); ((fn_i_t)f_fwd)(env, obj, 0); }
+            { void *f_dd = nf("nativeSetDefaultDisplay"); if (f_dd) { L("nativeSetDefaultDisplay(0)\n"); ((fn_i_t)f_dd)(env, obj, 0); } }
+            if (f_initjni) { L("initJni(Context)\n"); ((fn_p_t)f_initjni)(env, obj, jstrobj("android/content/Context")); }
+            { void *f_pp = nf("InitPlayerPrefs"); if (f_pp) { L("InitPlayerPrefs()\n"); ((fn_v_t)f_pp)(env, jstrobj("com/unity3d/player/PlayerPrefs")); } }
+            if (f_www) { L("nativeInitWWW(WWW)\n"); ((fn_p_t)f_www)(env, obj, jclsobj("com/unity3d/player/WWW")); }
+            if (f_extras) { L("nativeSetExtras(Bundle)\n"); ((fn_p_t)f_extras)(env, obj, jstrobj("android/os/Bundle")); }
+            if (f_init) { L("nativeInit(%d, %d)\n", na, nb); ((fn_ii_t)f_init)(env, obj, na, nb); }
+            if (f_recreate) { L("nativeRecreateGfxState(Surface)\n"); ((fn_p_t)f_recreate)(env, obj, jstrobj("android/view/Surface")); }
+            L("nativeResize(%d,%d,%d,%d)\n", w, h, w, h);
+            ((fn_iiii_t)f_resize)(env, obj, w, h, w, h);
+            if (f_uinit) { L("unityAndroidInit(\"assets/bin/\", \"%s\")\n", libdir); ((fn_pp_t)f_uinit)(env, obj, jstr("assets/bin/"), jstr(libdir)); }
+            if (f_uprep) { L("unityAndroidPrepareGameLoop()\n"); ((fn_v_t)f_uprep)(env, obj); }
+            L("nativeResize + nativeResume + nativeFocusChanged(1)\n");
+            ((fn_iiii_t)f_resize)(env, obj, w, h, w, h);
+            if (f_resume) ((fn_v_t)f_resume)(env, obj);
+            if (f_focus) ((fn_i_t)f_focus)(env, obj, 1);
+            L("init selesai, masuk loop nativeRender (frames=%d, 0=tak terbatas)\n", frames);
+
+            for (f = 0; !quit && (frames <= 0 || f < frames); f++) {
+              unsigned char ev[64]; unsigned err;
+              while (p_SDL_PollEvent(ev)) handle_event(ev, &quit);
+              pad_tick();
+              r = ((fn_r_t)f_render)(env, obj);
+              audio_poll(f);
+              pad_draw();
+              p_SDL_GL_SwapWindow(g_win);
+              err = p_glGetError ? p_glGetError() : 0;
+              if (err && nerr < 10) { L("[gl] glGetError=0x%x pada frame %d\n", err, f); nerr++; }
+              if (f < 5 || f % 120 == 0) L("[frame] %d nativeRender -> %d\n", f, r);
+            }
+            L("\n== keluar loop setelah %d frame ==\n", f);
+            audio_stop();
+            if (f_pause) { int pr = ((fn_r_t)f_pause)(env, obj); L("nativePause -> %d\n", pr); }
+            L("\n== ringkasan panggilan JNI (log tertunda) selesai ==\n");
+          }
+
           int main(int argc, char **argv) {
             static const char *p_gl1[] = { "libGLESv1_CM.so.1", "/usr/lib32/libGLESv1_CM.so.1", "/usr/lib32/libGLESv1_CM.so", NULL };
             static const char *p_gl2[] = { "libGLESv2.so.2", "/usr/lib32/libGLESv2.so.2", "/usr/lib32/libGLESv2.so", NULL };
             static const char *p_mali[] = { "libmali.so", "/usr/lib32/libmali.so", "/usr/lib32/libmali.so.1", NULL };
             static const char *p_egl[] = { "libEGL.so.1", "/usr/lib32/libEGL.so.1", "/usr/lib32/libEGL.so", NULL };
             const char *dir = "libs", *apk = "cordy.apk", *logf = "loader_log.txt";
-            int stage = 2, timeout = 0, i; Mod *mono = NULL, *unity = NULL; struct utsname u; stack_t ss; struct sigaction sa;
+            int stage = 2, timeout = 0, i, nina = 2, ninb = 2, frames = 0; Mod *mono = NULL, *unity = NULL; struct utsname u; stack_t ss; struct sigaction sa;
             if (argc > 1 && argv[1][0] != '-') dir = argv[1];
             for (i = 1; i < argc; i++) {
               if (!strcmp(argv[i], "--dry")) stage = 0;
               else if (!strcmp(argv[i], "--stage") && i + 1 < argc) stage = pint(argv[++i]);
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) apk = argv[++i];
               else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--ninit") && i + 2 < argc) { nina = pint(argv[++i]); ninb = pint(argv[++i]); }
               else if (!strcmp(argv[i], "--log") && i + 1 < argc) logf = argv[++i];
+          else if (!strcmp(argv[i], "--padmode") && i + 1 < argc) g_padmode = !strcmp(argv[++i], "controller");
               else if (!strcmp(argv[i], "--dump") && i + 1 < argc) add_dump(argv[++i]);
             }
             g_log = fopen(logf, "w");
-            L("== cordyloader (Cordy Android / Unity 3.5.4f1, Milestone 2) ==\n");
+            L("== cordyloader (Cordy Android / Unity 3.5.4f1, Milestone 3: SDL2+GLES2) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libdir=%s stage=%d apk=%s timeout=%d\n", dir, stage, apk, timeout);
+            L("[abi] sizeof(time_t)=%zu sizeof(off_t)=%zu sizeof(struct stat64)=%zu (stat bionic harus 104)\n", sizeof(time_t), sizeof(off_t), sizeof(struct stat64));
 
             ss.ss_sp = malloc(65536); ss.ss_size = 65536; ss.ss_flags = 0; sigaltstack(&ss, NULL);
             memset(&sa, 0, sizeof sa); sa.sa_sigaction = on_sig; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
@@ -963,6 +2205,7 @@ jobs:
             if (relocate(mono) || relocate(unity)) { L("GAGAL relokasi\n"); return 1; }
             if (stub_pool) { mprotect(stub_pool, STUB_MAX * 16, PROT_READ | PROT_EXEC); __builtin___clear_cache((char *)stub_pool, (char *)stub_pool + STUB_MAX * 16); }
             protect_mod(mono); protect_mod(unity);
+          patch_nullactor(unity);
             L("resolusi: modul=%d shim=%d gl=%d glibc=%d TIDAK ADA=%d (stub jebakan terpasang)\n", g_kc[1], g_kc[2], g_kc[3], g_kc[4], g_kc[0]);
             L("\n-- simbol TIDAK ADA (%d) -> jebakan: loader berhenti jelas bila dipanggil\n", g_nunres);
             for (i = 0; i < g_nunres; i++) L("  %s\n", g_unres[i]);
@@ -973,6 +2216,7 @@ jobs:
             L("\n-- shim yang terpakai (%d)\n  ", g_nsh);
             for (i = 0; i < g_nsh; i++) L("%s%s", g_shimhit[i], (i % 6 == 5) ? "\n  " : " ");
             L("\n");
+            selftest_alloc();
             run_dumps();
             if (stage < 1) { L("\n== STAGE 0 selesai (tidak ada kode game dijalankan) ==\n"); return 0; }
 
@@ -993,8 +2237,10 @@ jobs:
               int k, j;
               for (k = 0; want[k]; k++) { int ok = 0; for (j = 0; j < nnat; j++) if (!strcmp(nats[j].name, want[k])) ok = 1; L("  %-14s : %s\n", want[k], ok ? "terdaftar" : "BELUM"); }
             }
-            L("\n== STAGE 2 selesai. Stage 3 (EGL/GLES via SDL2 + nativeInit/nativeRender) belum ada ==\n");
-            return 0;
+            if (stage >= 3) { run_stage3(apk, nina, ninb, frames); L("\n== STAGE 3 selesai ==\n"); }
+            else L("\n== STAGE 2 selesai ==\n");
+            fflush(NULL);
+            _exit(0);
           }
           EOF_C1
           cat > src/gen_stubs.py <<'EOF_PY'
@@ -1054,8 +2300,25 @@ jobs:
           o.append("};")
           for k in range(233):
               nm = n[k]
-              if "Nonvirtual" in nm and nm.startswith("Call"):
+              if nm.startswith("Call") and ("LongMethod" in nm or "DoubleMethod" in nm):
+                  if "Nonvirtual" in nm:
+                      o.append("static uint64_t jstub_%d(void *e, void *o, void *c, void *m) { (void)e; (void)o; (void)c; return jcall64(%d, m); }" % (k, k))
+                  else:
+                      o.append("static uint64_t jstub_%d(void *e, void *o, void *m) { (void)e; (void)o; return jcall64(%d, m); }" % (k, k))
+              elif "Nonvirtual" in nm and nm.startswith("Call"):
                   o.append("static uint32_t jstub_%d(void *e, void *o, void *c, void *m) { (void)e; (void)o; (void)c; return jcall(%d, m); }" % (k, k))
+              elif nm == "NewObjectV":
+                  o.append("static uint32_t jstub_%d(void *e, void *o, void *m, va_list ap) { (void)e; (void)o; return jnewobj_v(%d, m, ap); }" % (k, k))
+              elif nm == "NewObjectA":
+                  o.append("static uint32_t jstub_%d(void *e, void *o, void *m, const void *a) { (void)e; (void)o; return jnewobj_a(%d, m, a); }" % (k, k))
+              elif nm == "NewObject":
+                  o.append("static uint32_t jstub_%d(void *e, void *o, void *m) { (void)e; (void)o; return jnewobj(%d, m); }" % (k, k))
+              elif nm.startswith("Call") and nm.endswith("MethodV"):
+                  o.append("static uint32_t jstub_%d(void *e, void *o, void *m, va_list ap) { (void)e; (void)o; return jcall_v(%d, m, ap); }" % (k, k))
+              elif nm.startswith("Call") and nm.endswith("MethodA"):
+                  o.append("static uint32_t jstub_%d(void *e, void *o, void *m, const void *a) { (void)e; (void)o; return jcall_a(%d, m, a); }" % (k, k))
+              elif nm.startswith("Call") and nm.endswith("Method"):
+                  o.append("static uint32_t jstub_%d(void *e, void *o, void *m, ...) { va_list ap; uint32_t r; (void)e; (void)o; va_start(ap, m); r = jcall_v(%d, m, ap); va_end(ap); return r; }" % (k, k))
               elif nm.startswith("Call") or nm.startswith("NewObject") and nm != "NewObjectArray":
                   o.append("static uint32_t jstub_%d(void *e, void *o, void *m) { (void)e; (void)o; return jcall(%d, m); }" % (k, k))
               else:
@@ -1116,7 +2379,17 @@ jobs:
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_TPL
-          echo "--stage 2 --timeout 60 --apk cordy.apk" > out/cordy_android/loader.args
+          echo "--stage 3 --timeout 0 --apk cordy.apk --ninit 2 2 --padmode controller" > out/cordy_android/loader.args
+          cat > out/cordy_android/buttons.cfg <<'EOF_CFG'
+          # Posisi tombol HUD Cordy untuk MODE CONTROLLER. Koordinat layar 640x480, (0,0) = kiri-atas.
+          # Format: nama x y   (nama: left right jump action pause hat). Ubah lalu jalankan ulang, tanpa build ulang.
+          left   50  352
+          right  137 410
+          jump   582 346
+          action 508 408
+          pause  597 72
+          hat    597 125
+          EOF_CFG
           echo "Taruh libunity.so dan libmono.so di folder ini. AMBIL DARI assets/libs/armeabi-v7a/ di dalam APK (6,8 MB dan 3,8 MB), BUKAN dari lib/armeabi-v7a/ (stub proxy). Salin juga APK Cordy ke folder cordy_android dengan nama cordy.apk. Jangan di-upload ke GitHub." > out/cordy_android/libs/TARUH-LIB-DI-SINI.txt
 
       - name: Buat stub JNI dan skrip peluncur
@@ -1124,9 +2397,11 @@ jobs:
           cd src && python3 gen_stubs.py && cd ..
           sed -e 's/@MODE@/STAGE dari loader.args/' -e 's/@ARG@//' src/launcher.tpl > out/CordyLoader.sh
           sed -e 's/@MODE@/DRY (stage 0)/' -e 's/@ARG@/--dry/' src/launcher.tpl > out/CordyLoader_dry.sh
+          sed -e 's/@MODE@/STAGE 2 (tanpa jendela)/' -e 's/@ARG@/--stage 2/' src/launcher.tpl > out/CordyLoader_stage2.sh
+          bash -n out/CordyLoader_stage2.sh
           bash -n out/CordyLoader.sh
           bash -n out/CordyLoader_dry.sh
-          DUMPARGS="--dry --dump unity:32ed00:700 --dump unity:32f9a0:180 --dump unity:330084:100 --dump unity:32e8cc:100 --dump unity:32ff94:80 --dump unity:32bf18:100"
+          DUMPARGS="--dry --dump unity:f7440:200 --dump unity:e95a0:60 --dump unity:106d00:80 --dump unity:22ac00:100 --dump unity:22ca00:40"
           sed -e 's/@MODE@/DUMP kode (stage 0)/' -e "s|@ARG@|$DUMPARGS|" src/launcher.tpl > out/CordyLoader_dump.sh
           bash -n out/CordyLoader_dump.sh
 
