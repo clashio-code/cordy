@@ -658,6 +658,37 @@ jobs:
           static int b_dlclose(void *h) { (void)h; return 0; }
           static const char *b_dlerror(void) { const char *e = dlerr; dlerr = NULL; return e; }
 
+          /* ======================= shim jendela & EGL: pakai konteks SDL yang sudah ada =======================
+           * libunity versi ini membuat permukaan/konteks EGL sendiri dari ANativeWindow. Di sini jendela dan konteks sudah dibuat SDL
+           * (aktif di thread utama), jadi semua pembuatan dipetakan ke yang sudah ada, dan swap dibiarkan ke SDL_GL_SwapWindow. */
+          static int g_fakewin[8];
+          static int g_egl_n;
+          #define ELOG(...) do { if (g_egl_n++ < 60) L(__VA_ARGS__); } while (0)
+          typedef void *(*egl_cur_t)(int);
+          typedef void *(*egl_ctx_t)(void);
+          static void *b_ANativeWindow_fromSurface(void *env, void *surf) { (void)env; (void)surf; ELOG("[egl] ANativeWindow_fromSurface -> jendela palsu\n"); return g_fakewin; }
+          static int b_ANativeWindow_setBuffersGeometry(void *w, int a, int b, int c) { (void)w; ELOG("[egl] ANativeWindow_setBuffersGeometry(%d,%d,%d) diabaikan\n", a, b, c); return 0; }
+          static void *b_eglCreateWindowSurface(void *d, void *c, void *w, const int *a) {
+            static egl_cur_t f; void *r; (void)d; (void)c; (void)w; (void)a;
+            if (!f) *(void **)&f = glsym("eglGetCurrentSurface");
+            r = f ? f(0x3059) : NULL; ELOG("[egl] eglCreateWindowSurface -> permukaan SDL %p\n", r); return r;
+          }
+          static void *b_eglCreateContext(void *d, void *c, void *sh, const int *a) {
+            static egl_ctx_t f; void *r; (void)d; (void)c; (void)sh;
+            if (!f) *(void **)&f = glsym("eglGetCurrentContext");
+            r = f ? f() : NULL; ELOG("[egl] eglCreateContext(attr=%d) -> konteks SDL %p\n", a ? a[1] : -1, r); return r;
+          }
+          static int b_eglMakeCurrent(void *d, void *dr, void *rd, void *c) { (void)d; (void)dr; (void)rd; ELOG("[egl] eglMakeCurrent(ctx=%p) diabaikan (sudah aktif)\n", c); return 1; }
+          static int b_eglSwapBuffers(void *d, void *s) { (void)d; (void)s; return 1; }
+          static int b_egl_true2(void *d, void *x) { (void)d; (void)x; ELOG("[egl] destroy/terminate diabaikan\n"); return 1; }
+          static int b_egl_true1(void *d) { (void)d; ELOG("[egl] eglTerminate diabaikan\n"); return 1; }
+          static int b_system_property_get(const char *n, char *v) { (void)n; if (v) v[0] = 0; return 0; }
+          static unsigned long long b_uldivmod_helper(unsigned long long a, unsigned long long b, unsigned long long *rem) {
+            if (!b) { if (rem) *rem = 0; return 0; }
+            if (rem) *rem = a % b;
+            return a / b;
+          }
+
           /* ======================= tabel shim ======================= */
           typedef struct { const char *name; void *addr; } Shim;
           #define S(n, f) { n, (void *)(f) }
@@ -714,6 +745,10 @@ jobs:
             S("__isnan", w_isnan), S("__isinf", w_isinf), S("__finite", w_finite),
             SW(glClearColor), SW(glColor4f), SW(glClearDepthf), SW(glAlphaFunc), SW(glFogf), SW(glLightModelf), SW(glLightf),
             SW(glMaterialf), SW(glTexParameterf), SW(glTexEnvf),
+            S("ANativeWindow_fromSurface", b_ANativeWindow_fromSurface), S("ANativeWindow_setBuffersGeometry", b_ANativeWindow_setBuffersGeometry),
+            S("eglCreateWindowSurface", b_eglCreateWindowSurface), S("eglCreateContext", b_eglCreateContext), S("eglMakeCurrent", b_eglMakeCurrent),
+            S("eglSwapBuffers", b_eglSwapBuffers), S("eglDestroySurface", b_egl_true2), S("eglDestroyContext", b_egl_true2), S("eglTerminate", b_egl_true1),
+            S("__system_property_get", b_system_property_get), S("__gnu_uldivmod_helper", b_uldivmod_helper),
             { NULL, NULL }
           };
 
