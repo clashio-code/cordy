@@ -1,4 +1,4 @@
-name: build-cordy-loader-m6-viewport-fix3
+name: build-cordy-loader-m6-input-fix4
 on:
   workflow_dispatch:
   push:
@@ -615,19 +615,19 @@ jobs:
             if (h_egl && (p = dlsym(h_egl, n))) return p;
             L("[gl] simbol %s tidak ditemukan\n", n); return NULL;
           }
-          /* ---- viewport fix: Unity kadang memasang viewport kecil di framebuffer utama. Catat 40 panggilan pertama, lalu paksa layar penuh bila fb==0 ---- */
+          /* ---- viewport fix: paksa viewport layar penuh HANYA untuk framebuffer utama (fb==0). Catat 40 panggilan pertama. ---- */
           static int g_sw, g_sh;   /* deklarasi awal; nilai asli (640x480) ada di bagian SDL */
           static int g_vp_n;
           static void (*r_glViewport)(int, int, int, int);
           static void (*r_glGetIntegerv)(unsigned, int *);
           static void b_glViewport(int x, int y, int w, int h) {
-            int fb = 0;
-            if (!r_glViewport) *(void **)&r_glViewport = glsym("glViewport");
-            if (!r_glGetIntegerv) *(void **)&r_glGetIntegerv = glsym("glGetIntegerv");
-            if (r_glGetIntegerv) r_glGetIntegerv(0x8CA6, &fb);   /* GL_FRAMEBUFFER_BINDING */
-            if (g_vp_n++ < 40) L("[gl] glViewport(%d,%d,%d,%d) fb=%d\n", x, y, w, h, fb);
-            if (fb == 0 && g_sw > 0 && (x || y || w != g_sw || h != g_sh)) { x = 0; y = 0; w = g_sw; h = g_sh; }
-            r_glViewport(x, y, w, h);
+          int fb = -1;
+          if (!r_glViewport) *(void **)&r_glViewport = glsym("glViewport");
+          if (!r_glGetIntegerv) { void *q = NULL; if (h_gl2) q = dlsym(h_gl2, "glGetIntegerv"); if (!q && h_mali) q = dlsym(h_mali, "glGetIntegerv"); *(void **)&r_glGetIntegerv = q; }
+          if (r_glGetIntegerv) r_glGetIntegerv(0x8CA6, &fb);   /* GL_FRAMEBUFFER_BINDING; -1 = query gagal -> jangan paksa */
+          if (g_vp_n++ < 40) L("[gl] glViewport(%d,%d,%d,%d) fb=%d\n", x, y, w, h, fb);
+          if (fb == 0 && g_sw > 0 && (x || y || w != g_sw || h != g_sh)) { x = 0; y = 0; w = g_sw; h = g_sh; }
+          r_glViewport(x, y, w, h);
           }
           typedef void (*gl_ff4)(float, float, float, float);
           typedef void (*gl_f1)(float);
@@ -989,6 +989,10 @@ jobs:
           typedef struct { char k[96]; char t; int i; float f; char s[256]; } PPE;
           static PPE g_pp[256]; static int g_npp, g_pp_loaded, g_pp_dirty, g_pplog;
           static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+          /* ---- MotionEvent palsu untuk nativeInjectEvent (libunity ini TIDAK punya nativeTouch) ---- */
+          static struct { int action, n; int id[10]; float x[10], y[10]; int64_t t; } g_mev;
+          static void *g_mevobj;
+          static int g_mev_log;
           static void pp_clean(char *s) { for (; *s; s++) if (*s == '\t' || *s == '\n' || *s == '\r') *s = ' '; }
           static void pp_save(void) {
             char p[460], tmp[470]; FILE *fp; int i;
@@ -1308,6 +1312,27 @@ jobs:
           static int jhost(const JObj *m, const JArg *a, int na, uint32_t *ret) {
             const char *c = m->a, *n = m->b;
             (void)na;
+          if (strstr(c, "MotionEvent") || strstr(c, "InputEvent")) {
+            int hasi = (m->c[0] == '(' && m->c[1] == 'I'), pi = hasi ? (int)a[0].lo : 0, k;
+            if (pi < 0 || pi >= g_mev.n) pi = 0;
+            *ret = 0;
+            if (!strcmp(n, "getAction")) *ret = (uint32_t)g_mev.action;
+            else if (!strcmp(n, "getActionMasked")) *ret = (uint32_t)(g_mev.action & 0xff);
+            else if (!strcmp(n, "getActionIndex")) *ret = (uint32_t)((g_mev.action >> 8) & 0xff);
+            else if (!strcmp(n, "getPointerCount")) *ret = (uint32_t)g_mev.n;
+            else if (!strcmp(n, "getPointerId")) *ret = (uint32_t)g_mev.id[pi];
+            else if (!strcmp(n, "findPointerIndex")) { int want = (int)a[0].lo; *ret = (uint32_t)-1; for (k = 0; k < g_mev.n; k++) if (g_mev.id[k] == want) *ret = (uint32_t)k; }
+            else if (!strcmp(n, "getX") || !strcmp(n, "getRawX") || !strcmp(n, "getHistoricalX")) *ret = f2u(g_mev.x[pi]);
+            else if (!strcmp(n, "getY") || !strcmp(n, "getRawY") || !strcmp(n, "getHistoricalY")) *ret = f2u(g_mev.y[pi]);
+            else if (!strcmp(n, "getAxisValue")) { int ax = (int)a[0].lo, ix = (m->c[2] == 'I' && m->c[3] == ')') ? 0 : (int)a[1].lo; if (ix < 0 || ix >= g_mev.n) ix = 0; *ret = f2u(ax == 0 ? g_mev.x[ix] : ax == 1 ? g_mev.y[ix] : 0.f); }
+            else if (!strcmp(n, "getPressure") || !strcmp(n, "getSize")) *ret = f2u(1.0f);
+            else if (!strcmp(n, "getSource")) *ret = 0x1002u;
+            else if (!strcmp(n, "getToolType")) *ret = 1u;
+            else if (!strcmp(n, "getDeviceId") || !strcmp(n, "getMetaState") || !strcmp(n, "getFlags") || !strcmp(n, "getEdgeFlags") ||
+                     !strcmp(n, "getButtonState") || !strcmp(n, "getHistorySize") || !strcmp(n, "getTouchMajor") || !strcmp(n, "getTouchMinor")) *ret = 0;
+            else if (g_mev_log < 80) { g_mev_log++; L("[mev] metode %s.%s%s belum ditangani -> 0\n", c, n, m->c); }
+            return 1;
+          }
             if (!strcmp(c, "java/lang/Class")) {
               if (!strcmp(n, "forName")) {
                 char t[128]; size_t i;
@@ -1469,6 +1494,7 @@ jobs:
             const JObj *m = (const JObj *)mid;
             uint32_t lo = jcall(slot, mid);
             if (m && m->magic == JM_MTH && !strcmp(m->b, "getTotalMemory")) return 1073741824ull;
+            if (m && m->magic == JM_MTH && strstr(m->a, "MotionEvent") && (!strcmp(m->b, "getEventTime") || !strcmp(m->b, "getDownTime") || !strcmp(m->b, "getHistoricalEventTime"))) return (uint64_t)g_mev.t;
             return (uint64_t)lo;
           }
           static uint32_t jtrap(int slot) {
@@ -1479,6 +1505,7 @@ jobs:
           static int j_GetVersion(void *e) { (void)e; return 0x00010006; }
           static void *j_FindClass(void *e, const char *name) { (void)e; L("[JNI] FindClass(%s)\n", name); return jnew(JM_CLS, name, "", ""); }
           static void *j_Null(void) { return NULL; }
+          static int j_IsInstanceOf(void *e, void *o, void *c) { (void)e; (void)c; return (o && o == g_mevobj) ? 1 : 0; }
           static void j_Void(void) {}
           static void *j_NewRef(void *e, void *o) { (void)e; return o; }
           static void *j_GetObjectClass(void *e, void *o) { const JObj *p = (const JObj *)o; (void)e; return jnew(JM_CLS, (p && p->magic == JM_STR && p->a[0]) ? p->a : "java/lang/Object", "", ""); }
@@ -1519,7 +1546,7 @@ jobs:
             for (i = 0; i < 233; i++) g_jni[i] = jstubs[i];
             g_jni[4] = (void *)j_GetVersion; g_jni[6] = (void *)j_FindClass; g_jni[15] = (void *)j_Null; g_jni[17] = (void *)j_Void;
             g_jni[21] = (void *)j_NewRef; g_jni[22] = (void *)j_Void; g_jni[23] = (void *)j_Void; g_jni[25] = (void *)j_NewRef;
-            g_jni[31] = (void *)j_GetObjectClass; g_jni[33] = (void *)j_GetMethodID; g_jni[94] = (void *)j_GetFieldID;
+            g_jni[31] = (void *)j_GetObjectClass; g_jni[32] = (void *)j_IsInstanceOf; g_jni[33] = (void *)j_GetMethodID; g_jni[94] = (void *)j_GetFieldID;
             g_jni[113] = (void *)j_GetMethodID; g_jni[144] = (void *)j_GetFieldID; g_jni[167] = (void *)j_NewStringUTF;
             g_jni[168] = (void *)j_GetStringUTFLength; g_jni[169] = (void *)j_GetStringUTFChars; g_jni[170] = (void *)j_Void;
             g_jni[171] = (void *)j_GetArrayLength; g_jni[215] = (void *)j_RegisterNatives; g_jni[219] = (void *)j_GetJavaVM; g_jni[228] = (void *)j_Null;
@@ -1735,6 +1762,8 @@ jobs:
           static void *nf(const char *name) { int i; for (i = 0; i < nnat; i++) if (!strcmp(nats[i].name, name)) return nats[i].fn; L("[native] %s TIDAK terdaftar\n", name); return NULL; }
           static void *g_nenv, *g_nobj;
           static fn_touch_t g_ntouch;
+          typedef int (*fn_inj_t)(void *, void *, void *);
+          static fn_inj_t g_ninject;
           static int64_t now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000; }
 
           /* ---- gamepad: 2 mode ----
@@ -1760,7 +1789,18 @@ jobs:
           static int g_ntap_log;
           static void touch_ev(int id, int action, float x, float y) {
             if (g_ntap_log < 120 && action != 2) { g_ntap_log++; L("[touch] id=%d action=%d x=%.0f y=%.0f (source=0x%x)\n", id, action, (double)x, (double)y, SRC_TOUCHSCREEN); }
-            if (g_ntouch) g_ntouch(g_nenv, g_nobj, id, x, y, action, now_ms(), SRC_TOUCHSCREEN);
+            if (g_ntouch) { g_ntouch(g_nenv, g_nobj, id, x, y, action, now_ms(), SRC_TOUCHSCREEN); return; }
+          if (g_ninject) {   /* bangun MotionEvent palsu berisi semua jari aktif */
+            int i, n = 0, idx = 0, act, r;
+            if (!g_mevobj) g_mevobj = jstrobj("android/view/MotionEvent");
+            for (i = 0; i < MAXF && n < 10; i++) if (g_fg[i].used) { if (i == id) idx = n; g_mev.id[n] = i; g_mev.x[n] = g_fg[i].x; g_mev.y[n] = g_fg[i].y; n++; }
+            if (n == 0) { g_mev.id[0] = id; g_mev.x[0] = x; g_mev.y[0] = y; n = 1; idx = 0; }
+            g_mev.n = n;
+            act = (action == 2) ? 2 : (action == 0) ? (n == 1 ? 0 : (5 | (idx << 8))) : (n == 1 ? 1 : (6 | (idx << 8)));
+            g_mev.action = act; g_mev.t = now_ms();
+            r = g_ninject(g_nenv, g_nobj, g_mevobj);
+            if (g_mev_log < 30 && action != 2) { g_mev_log++; L("[mev] nativeInjectEvent action=0x%x n=%d x=%.0f y=%.0f -> %d\n", act, n, (double)x, (double)y, r); }
+          }
           }
           /* kolam jari: id sentuh = slot bebas terendah (seperti pointerId Android); jari pertama = id 0 (juga dipakai emulasi mouse Unity) */
           static void ft_down(int key, float x, float y) {
@@ -2122,6 +2162,7 @@ jobs:
             struct sigaction sa;
             g_nenv = env; g_nobj = obj;
             *(void **)&g_ntouch = nf("nativeTouch");
+            *(void **)&g_ninject = nf("nativeInjectEvent");
             if (!f_file || (!f_init && !f_initjni) || !f_render || !f_resize) { L("[stage3] native penting tidak lengkap, berhenti\n"); return; }
             if (!getcwd(g_cwd, sizeof g_cwd)) snprintf(g_cwd, sizeof g_cwd, ".");
             { char *rp = realpath(apk, NULL); if (rp) { snprintf(g_apkabs, sizeof g_apkabs, "%s", rp); free(rp); } else snprintf(g_apkabs, sizeof g_apkabs, "%s/%s", g_cwd, apk); }
