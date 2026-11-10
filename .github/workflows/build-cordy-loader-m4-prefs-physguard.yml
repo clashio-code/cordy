@@ -892,8 +892,8 @@ jobs:
               if (n < 4 || ln[1] != '\t') continue;
               a = ln + 2; b = strchr(a, '\t'); if (!b) continue; *b++ = 0;
               e = &g_pp[g_npp++]; memset(e, 0, sizeof *e);
-              snprintf(e->k, sizeof e->k, "%s", a); e->t = ln[0];
-              if (e->t == 'I') e->i = atoi(b); else if (e->t == 'F') e->f = (float)atof(b); else snprintf(e->s, sizeof e->s, "%s", b);
+              snprintf(e->k, sizeof e->k, "%.95s", a); e->t = ln[0];
+              if (e->t == 'I') { const char *q = b; int neg = 0, v = 0; if (*q == '-') { neg = 1; q++; } while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0'); e->i = neg ? -v : v; } else if (e->t == 'F') e->f = (float)atof(b); else snprintf(e->s, sizeof e->s, "%s", b);
             }
             fclose(fp); L("[prefs] dimuat %d kunci dari %s\n", g_npp, p);
           }
