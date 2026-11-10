@@ -746,7 +746,7 @@ jobs:
                 for (i = 0; i < nmods; i++) {
                   const Mod *m = &mods[i];
                   if (pc >= (uintptr_t)m->base && pc < (uintptr_t)m->base + m->span) {
-                    uintptr_t from = pc - 64, to = pc + 48;
+                    uintptr_t from = pc - 0x180, to = pc + 0x40;
                     if (from < (uintptr_t)m->base) from = (uintptr_t)m->base;
                     if (to > (uintptr_t)m->base + m->span) to = (uintptr_t)m->base + m->span;
                     L("  vaddr di %s: 0x%x (objdump -d -M force-thumb --start-address=0x%x --stop-address=0x%x)\n", m->name, (unsigned)(pc - m->bias), (unsigned)(from - m->bias), (unsigned)(to - m->bias));
@@ -862,6 +862,47 @@ jobs:
             (void)g_unity_cls;
           }
 
+          /* --dump MOD:VADDRHEX:LENHEX  -> cetak byte kode modul (setelah relokasi) untuk dianalisis offline */
+          typedef struct { char mod[16]; uint32_t v, len; } DumpReq;
+          static DumpReq dumps[12]; static int ndump;
+          static uint32_t phex(const char **p) {
+            uint32_t v = 0; const char *s = *p;
+            for (;; s++) {
+              if (*s >= '0' && *s <= '9') v = v * 16 + (uint32_t)(*s - '0');
+              else if (*s >= 'a' && *s <= 'f') v = v * 16 + (uint32_t)(*s - 'a' + 10);
+              else if (*s >= 'A' && *s <= 'F') v = v * 16 + (uint32_t)(*s - 'A' + 10);
+              else break;
+            }
+            *p = s; return v;
+          }
+          static void add_dump(const char *spec) {
+            DumpReq *d; const char *p = spec; size_t n = 0;
+            if (ndump >= 12) return;
+            d = &dumps[ndump];
+            while (*p && *p != ':' && n < sizeof d->mod - 1) d->mod[n++] = *p++;
+            d->mod[n] = 0;
+            if (*p != ':') return;
+            p++; d->v = phex(&p);
+            if (*p != ':') return;
+            p++; d->len = phex(&p);
+            ndump++;
+          }
+          static void run_dumps(void) {
+            int i;
+            for (i = 0; i < ndump; i++) {
+              Mod *m = NULL; int k; uint32_t a;
+              for (k = 0; k < nmods; k++) if (strstr(mods[k].name, dumps[i].mod)) m = &mods[k];
+              if (!m) { L("[dump] modul %s tidak ada\n", dumps[i].mod); continue; }
+              if (dumps[i].v + dumps[i].len > m->minv + m->span) { L("[dump] range di luar modul\n"); continue; }
+              L("[dump] %s vaddr 0x%x len 0x%x\n", m->name, dumps[i].v, dumps[i].len);
+              for (a = dumps[i].v; a < dumps[i].v + dumps[i].len; a += 16) {
+                uint32_t j; L("  kode %06x:", a);
+                for (j = 0; j < 16 && a + j < dumps[i].v + dumps[i].len; j++) L(" %02x", ((uint8_t *)(m->bias + a))[j]);
+                L("\n");
+              }
+            }
+          }
+
           /* ======================= main ======================= */
           static void *try_open(const char *label, const char *const *paths) {
             int i; void *h = NULL;
@@ -897,6 +938,7 @@ jobs:
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) apk = argv[++i];
               else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
               else if (!strcmp(argv[i], "--log") && i + 1 < argc) logf = argv[++i];
+              else if (!strcmp(argv[i], "--dump") && i + 1 < argc) add_dump(argv[++i]);
             }
             g_log = fopen(logf, "w");
             L("== cordyloader (Cordy Android / Unity 3.5.4f1, Milestone 2) ==\n");
@@ -931,6 +973,7 @@ jobs:
             L("\n-- shim yang terpakai (%d)\n  ", g_nsh);
             for (i = 0; i < g_nsh; i++) L("%s%s", g_shimhit[i], (i % 6 == 5) ? "\n  " : " ");
             L("\n");
+            run_dumps();
             if (stage < 1) { L("\n== STAGE 0 selesai (tidak ada kode game dijalankan) ==\n"); return 0; }
 
             L("\n== STAGE 1: konstruktor ==\n");
@@ -1083,6 +1126,9 @@ jobs:
           sed -e 's/@MODE@/DRY (stage 0)/' -e 's/@ARG@/--dry/' src/launcher.tpl > out/CordyLoader_dry.sh
           bash -n out/CordyLoader.sh
           bash -n out/CordyLoader_dry.sh
+          DUMPARGS="--dry --dump unity:32ed00:700 --dump unity:32f9a0:180 --dump unity:330084:100 --dump unity:32e8cc:100 --dump unity:32ff94:80 --dump unity:32bf18:100"
+          sed -e 's/@MODE@/DUMP kode (stage 0)/' -e "s|@ARG@|$DUMPARGS|" src/launcher.tpl > out/CordyLoader_dump.sh
+          bash -n out/CordyLoader_dump.sh
 
       - name: Kompilasi (armhf)
         run: |
