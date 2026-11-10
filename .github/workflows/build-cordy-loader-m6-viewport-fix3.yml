@@ -1,4 +1,4 @@
-name: build-cordy-loader-m6-resize-fix6
+name: build-cordy-loader-m6-perf-fix7
 on:
   workflow_dispatch:
   push:
@@ -633,8 +633,7 @@ jobs:
             int fb = -1;
             if (!r_glScissor) *(void **)&r_glScissor = glsym("glScissor");
             if (!r_glGetIntegerv) { void *q = NULL; if (h_gl2) q = dlsym(h_gl2, "glGetIntegerv"); if (!q && h_mali) q = dlsym(h_mali, "glGetIntegerv"); *(void **)&r_glGetIntegerv = q; }
-            if (r_glGetIntegerv) r_glGetIntegerv(0x8CA6, &fb);
-            vp_seen(1, x, y, w, h, fb);
+                        vp_seen(1, x, y, w, h, fb);
             r_glScissor(x, y, w, h);
           }
           static void (*r_glViewport)(int, int, int, int);
@@ -642,8 +641,7 @@ jobs:
           int fb = -1;
           if (!r_glViewport) *(void **)&r_glViewport = glsym("glViewport");
           if (!r_glGetIntegerv) { void *q = NULL; if (h_gl2) q = dlsym(h_gl2, "glGetIntegerv"); if (!q && h_mali) q = dlsym(h_mali, "glGetIntegerv"); *(void **)&r_glGetIntegerv = q; }
-          if (r_glGetIntegerv) r_glGetIntegerv(0x8CA6, &fb);   /* GL_FRAMEBUFFER_BINDING; -1 = query gagal -> jangan paksa */
-          vp_seen(0, x, y, w, h, fb);
+                    vp_seen(0, x, y, w, h, fb);
           r_glViewport(x, y, w, h);
           }
           typedef void (*gl_ff4)(float, float, float, float);
@@ -2220,18 +2218,30 @@ jobs:
             L("init selesai, masuk loop nativeRender (frames=%d, 0=tak terbatas)\n", frames);
 
             for (f = 0; !quit && (frames <= 0 || f < frames); f++) {
-              unsigned char ev[64]; unsigned err;
+            unsigned char ev[64]; unsigned err; struct timespec q0, q1, q2, q3;
               while (p_SDL_PollEvent(ev)) handle_event(ev, &quit);
               pad_tick();
-              r = ((fn_r_t)f_render)(env, obj);
+              clock_gettime(CLOCK_MONOTONIC, &q0);
+            r = ((fn_r_t)f_render)(env, obj);
+            clock_gettime(CLOCK_MONOTONIC, &q1);
             if (g_resize_req || f == 2 || f == 10) {   /* Java asli membalas triggerResizeCall dengan nativeResize(ukuran surface) SETELAH GL siap */
               g_resize_req = 0; L("[scr] nativeResize ulang (%d,%d) pada frame %d\n", w, h, f);
               ((fn_iiii_t)f_resize)(env, obj, w, h, w, h);
             }
               audio_poll(f);
               pad_draw();
-              p_SDL_GL_SwapWindow(g_win);
-              err = p_glGetError ? p_glGetError() : 0;
+              clock_gettime(CLOCK_MONOTONIC, &q2);
+            p_SDL_GL_SwapWindow(g_win);
+            clock_gettime(CLOCK_MONOTONIC, &q3);
+            { static double tr, ta, ts; static int tn; static struct timespec tw;
+              tr += (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) / 1e6;
+              ta += (q2.tv_sec - q1.tv_sec) * 1e3 + (q2.tv_nsec - q1.tv_nsec) / 1e6;
+              ts += (q3.tv_sec - q2.tv_sec) * 1e3 + (q3.tv_nsec - q2.tv_nsec) / 1e6;
+              if (++tn == 120) { double el = (q3.tv_sec - tw.tv_sec) * 1e3 + (q3.tv_nsec - tw.tv_nsec) / 1e6;
+                if (tw.tv_sec) L("[fps] %.1f fps | nativeRender %.1f ms | audio+pad %.1f ms | swap %.1f ms (rata-rata/frame)\n", 120000.0 / el, tr / 120, ta / 120, ts / 120);
+                tw = q3; tn = 0; tr = ta = ts = 0; }
+              if (!tw.tv_sec) tw = q3; }
+            err = p_glGetError ? p_glGetError() : 0;
               if (err && nerr < 10) { L("[gl] glGetError=0x%x pada frame %d\n", err, f); nerr++; }
               if (f < 5 || f % 120 == 0) L("[frame] %d nativeRender -> %d\n", f, r);
             }
