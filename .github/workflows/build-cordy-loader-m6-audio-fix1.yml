@@ -319,7 +319,7 @@ jobs:
               case 0x00: return sysconf(_SC_ARG_MAX);
               case 0x06: return sysconf(_SC_CLK_TCK);
               case 0x0b: return sysconf(_SC_OPEN_MAX);
-              case 0x27: return sysconf(_SC_PAGESIZE);
+              case 0x27: case 0x28: return sysconf(_SC_PAGESIZE);
               case 0x60: return sysconf(_SC_NPROCESSORS_CONF);
               case 0x61: return sysconf(_SC_NPROCESSORS_ONLN);
               case 0x62: return sysconf(_SC_PHYS_PAGES);
@@ -689,6 +689,33 @@ jobs:
             return a / b;
           }
 
+          /* ======================= shim NativeActivity / input / sensor (Unity 4.5) =======================
+           * libunity 4.5 memanggil fungsi NativeActivity milik libmain.so (tidak kita muat) serta looper/sensor Android.
+           * Di sini semuanya dibuat "kosong yang aman": tidak ada antrian input dari Android, tidak ada sensor. */
+          static int g_fakelooper[4], g_fakesm[4], g_fakesq[4];
+          static int g_na_n;
+          #define NLOG(...) do { if (g_na_n++ < 40) L(__VA_ARGS__); } while (0)
+          static void *b_na_getInputQueue(void) { NLOG("[na] ANativeActivity_getInputQueue -> NULL\n"); return NULL; }
+          static void b_na_void0(void) { }
+          static void b_na_void1(int a) { NLOG("[na] ANativeActivity_setFirstLevelHasBeenLoaded/enableWatchdog(%d)\n", a); }
+          static void b_na_fwd(void *e, void *env) { (void)e; (void)env; }
+          static void *b_ALooper_prepare(int o) { (void)o; NLOG("[na] ALooper_prepare\n"); return g_fakelooper; }
+          static void *b_ALooper_forThread(void) { return g_fakelooper; }
+          static int b_ALooper_pollAll(int t, int *fd, int *ev, void **data) { (void)t; if (fd) *fd = 0; if (ev) *ev = 0; if (data) *data = NULL; return -3; }
+          static void b_AInputQueue_attachLooper(void *q, void *l, int id, void *cb, void *d) { (void)q; (void)l; (void)id; (void)cb; (void)d; NLOG("[na] AInputQueue_attachLooper diabaikan\n"); }
+          static int b_AInputQueue_getEvent(void *q, void **e) { (void)q; if (e) *e = NULL; return -1; }
+          static int b_AInputQueue_preDispatchEvent(void *q, void *e) { (void)q; (void)e; return 0; }
+          static void b_AInputQueue_finishEvent(void *q, void *e, int h) { (void)q; (void)e; (void)h; }
+          static void *b_ASensorManager_getInstance(void) { NLOG("[na] ASensorManager_getInstance -> palsu\n"); return g_fakesm; }
+          static void *b_ASensorManager_getDefaultSensor(void *m, int t) { (void)m; NLOG("[na] ASensorManager_getDefaultSensor(%d) -> NULL (tidak ada sensor)\n", t); return NULL; }
+          static int b_ASensorManager_getSensorList(void *m, void **l) { (void)m; if (l) *l = NULL; return 0; }
+          static void *b_ASensorManager_createEventQueue(void *m, void *lo, int id, void *cb, void *d) { (void)m; (void)lo; (void)id; (void)cb; (void)d; return g_fakesq; }
+          static int b_ASensorManager_destroyEventQueue(void *m, void *q) { (void)m; (void)q; return 0; }
+          static int b_ASensorEventQueue_zero2(void *q, void *s) { (void)q; (void)s; return 0; }
+          static int b_ASensorEventQueue_setEventRate(void *q, void *s, int r) { (void)q; (void)s; (void)r; return 0; }
+          static int b_ASensorEventQueue_hasEvents(void *q) { (void)q; return 0; }
+          static int b_ASensorEventQueue_getEvents(void *q, void *ev, size_t n) { (void)q; (void)ev; (void)n; return 0; }
+
           /* ======================= tabel shim ======================= */
           typedef struct { const char *name; void *addr; } Shim;
           #define S(n, f) { n, (void *)(f) }
@@ -749,6 +776,17 @@ jobs:
             S("eglCreateWindowSurface", b_eglCreateWindowSurface), S("eglCreateContext", b_eglCreateContext), S("eglMakeCurrent", b_eglMakeCurrent),
             S("eglSwapBuffers", b_eglSwapBuffers), S("eglDestroySurface", b_egl_true2), S("eglDestroyContext", b_egl_true2), S("eglTerminate", b_egl_true1),
             S("__system_property_get", b_system_property_get), S("__gnu_uldivmod_helper", b_uldivmod_helper),
+            S("_Z29ANativeActivity_getInputQueuev", b_na_getInputQueue), S("_Z42ANativeActivity_setFirstLevelHasBeenLoadedb", b_na_void1),
+            S("_Z30ANativeActivity_enableWatchdogb", b_na_void1), S("_Z28ANativeActivity_feedWatchdogv", b_na_void0),
+            S("_Z42ANativeActivity_forwardMotionEventToDalvikP11AInputEventP7_JNIEnv", b_na_fwd),
+            S("ALooper_prepare", b_ALooper_prepare), S("ALooper_forThread", b_ALooper_forThread), S("ALooper_pollAll", b_ALooper_pollAll),
+            S("AInputQueue_attachLooper", b_AInputQueue_attachLooper), S("AInputQueue_getEvent", b_AInputQueue_getEvent),
+            S("AInputQueue_preDispatchEvent", b_AInputQueue_preDispatchEvent), S("AInputQueue_finishEvent", b_AInputQueue_finishEvent),
+            S("ASensorManager_getInstance", b_ASensorManager_getInstance), S("ASensorManager_getDefaultSensor", b_ASensorManager_getDefaultSensor),
+            S("ASensorManager_getSensorList", b_ASensorManager_getSensorList), S("ASensorManager_createEventQueue", b_ASensorManager_createEventQueue),
+            S("ASensorManager_destroyEventQueue", b_ASensorManager_destroyEventQueue), S("ASensorEventQueue_enableSensor", b_ASensorEventQueue_zero2),
+            S("ASensorEventQueue_disableSensor", b_ASensorEventQueue_zero2), S("ASensorEventQueue_setEventRate", b_ASensorEventQueue_setEventRate),
+            S("ASensorEventQueue_hasEvents", b_ASensorEventQueue_hasEvents), S("ASensorEventQueue_getEvents", b_ASensorEventQueue_getEvents),
             { NULL, NULL }
           };
 
