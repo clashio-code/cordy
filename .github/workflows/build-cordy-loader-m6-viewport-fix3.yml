@@ -1,4 +1,4 @@
-name: build-cordy-loader-m6-input-fix5
+name: build-cordy-loader-m6-resize-fix6
 on:
   workflow_dispatch:
   push:
@@ -1010,6 +1010,7 @@ jobs:
           static struct { int action, n; int id[10]; float x[10], y[10]; int64_t t; } g_mev;
           static void *g_mevobj;
           static int g_mev_log;
+          static volatile int g_resize_req;   /* diminta Unity lewat triggerResizeCall/setScreenSize -> panggil nativeResize ulang dari loop utama */
           static void pp_clean(char *s) { for (; *s; s++) if (*s == '\t' || *s == '\n' || *s == '\r') *s = ' '; }
           static void pp_save(void) {
             char p[460], tmp[470]; FILE *fp; int i;
@@ -1329,7 +1330,8 @@ jobs:
           static int jhost(const JObj *m, const JArg *a, int na, uint32_t *ret) {
             const char *c = m->a, *n = m->b;
             (void)na;
-            if (!strcmp(n, "setScreenSize")) { L("[scr] UnityPlayer.setScreenSize(%d, %d, %d)\n", (int)a[0].lo, (int)a[1].lo, (int)a[2].lo); *ret = 0; return 1; }
+            if (!strcmp(n, "triggerResizeCall")) { g_resize_req = 1; *ret = 0; return 1; }
+            if (!strcmp(n, "setScreenSize")) { g_resize_req = 1; L("[scr] UnityPlayer.setScreenSize(%d, %d, %d)\n", (int)a[0].lo, (int)a[1].lo, (int)a[2].lo); *ret = 0; return 1; }
           if (strstr(c, "MotionEvent") || strstr(c, "InputEvent")) {
             int hasi = (m->c[0] == '(' && m->c[1] == 'I'), pi = hasi ? (int)a[0].lo : 0, k;
             if (pi < 0 || pi >= g_mev.n) pi = 0;
@@ -2222,6 +2224,10 @@ jobs:
               while (p_SDL_PollEvent(ev)) handle_event(ev, &quit);
               pad_tick();
               r = ((fn_r_t)f_render)(env, obj);
+            if (g_resize_req || f == 2 || f == 10) {   /* Java asli membalas triggerResizeCall dengan nativeResize(ukuran surface) SETELAH GL siap */
+              g_resize_req = 0; L("[scr] nativeResize ulang (%d,%d) pada frame %d\n", w, h, f);
+              ((fn_iiii_t)f_resize)(env, obj, w, h, w, h);
+            }
               audio_poll(f);
               pad_draw();
               p_SDL_GL_SwapWindow(g_win);
